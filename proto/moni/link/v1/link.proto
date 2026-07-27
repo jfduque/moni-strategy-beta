@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package moni.link.v1;
+
+service EngineLink {
+  rpc GetEngineInfo(GetEngineInfoRequest) returns (EngineInfo);
+  rpc SubmitCompleteSetSignal(SubmitCompleteSetSignalRequest) returns (SubmitCompleteSetSignalResponse);
+}
+
+message GetEngineInfoRequest {}
+message EngineInfo { string engine_id = 1; string build = 2; }
+
+enum CompleteSetDirection {
+  COMPLETE_SET_DIRECTION_UNSPECIFIED = 0;
+  COMPLETE_SET_DIRECTION_BUY_MERGE = 1;
+  COMPLETE_SET_DIRECTION_SPLIT_SELL = 2;
+}
+
+message SubmitCompleteSetSignalRequest {
+  string signal_id = 1;
+  string strategy_id = 2;
+  string source = 3;
+  string market_id = 4;
+  string condition_id = 5;
+  string token_a_id = 6;
+  string token_b_id = 7;
+  CompleteSetDirection direction = 8;
+  string quantity = 9;
+  string max_pair_cost = 10;
+  string min_pair_proceeds = 11;
+  string expected_profit = 12;
+  string expected_return_bps = 13;
+  int64 token_a_book_observed_at_ms = 14;
+  int64 token_b_book_observed_at_ms = 15;
+  int64 observed_at_ms = 16;
+}
+
+message SubmitCompleteSetSignalResponse {
+  bool accepted = 1;
+  string reason = 2;
+  bool duplicate = 3;
+}

@@ -1,0 +1,624 @@
+use crate::clients::{Monitor, Store};
+use crate::clob::{MarketFeed, RestClient};
+use crate::config::RuntimeConfig;
+use crate::gamma::{BinaryCryptoMarket, GammaClient};
+use crate::gate::{
+    CalibrationSample, CircuitState, DurationBucket, GateKey, GateState, append_jsonl,
+};
+use crate::link::{SubmitOutcome, Submitter, request};
+use crate::pricing::{
+    Book, Direction, Opportunity, best_for_direction, validate_fee_metadata, validate_final_books,
+};
+use anyhow::{Context, Result, bail};
+use rust_decimal::Decimal;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use tokio::sync::{RwLock, watch};
+
+#[derive(Clone, Debug, Serialize)]
+struct Decision {
+    observed_at_ms: i64,
+    market_id: String,
+    direction: Option<Direction>,
+    quantity: Option<Decimal>,
+    expected_profit: Option<Decimal>,
+    gate_unlocked: bool,
+    submitted: bool,
+    reason: String,
+    store_coverage_a: Option<bool>,
+    store_coverage_b: Option<bool>,
+}
+
+#[derive(Default)]
+struct EpisodeTracker {
+    active: BTreeMap<(String, Direction), String>,
+    sequence: u64,
+}
+
+impl EpisodeTracker {
+    fn episode(&mut self, market_id: &str, direction: Direction) -> String {
+        self.active
+            .entry((market_id.to_owned(), direction))
+            .or_insert_with(|| {
+                self.sequence = self.sequence.saturating_add(1);
+                format!(
+                    "{market_id}:{}:{}",
+                    direction_label(direction),
+                    self.sequence
+                )
+            })
+            .clone()
+    }
+
+    fn close_other_directions(&mut self, market_id: &str, direction: Direction) {
+        self.active
+            .retain(|(existing_market, existing_direction), _| {
+                existing_market != market_id || *existing_direction == direction
+            });
+    }
+
+    fn close_market(&mut self, market_id: &str) {
+        self.active
+            .retain(|(existing_market, _), _| existing_market != market_id);
+    }
+}
+
+pub struct StrategyService {
+    config: RuntimeConfig,
+    observe_only: bool,
+    gamma: GammaClient,
+    rest: RestClient,
+    submitter: Submitter,
+    monitor: Monitor,
+    store: Option<Store>,
+    target_sender: watch::Sender<BTreeSet<String>>,
+    books: Arc<RwLock<HashMap<String, Book>>>,
+    gates: GateState,
+    circuits: CircuitState,
+    episodes: EpisodeTracker,
+    submitted: BTreeMap<String, (String, Direction, Decimal, String)>,
+    daily_loss_halted: bool,
+}
+
+impl StrategyService {
+    pub async fn connect(config: RuntimeConfig, observe_only: bool) -> Result<Self> {
+        let api_key = std::env::var(&config.monitor.api_key_env).with_context(|| {
+            format!(
+                "Monitor key environment variable {} is not set",
+                config.monitor.api_key_env
+            )
+        })?;
+        let submitter = Submitter::connect(config.link.endpoint.clone()).await?;
+        let monitor = Monitor::connect(
+            config.monitor.endpoint.clone(),
+            &api_key,
+            config.monitor.tenant_id.clone(),
+        )
+        .await?;
+        let store = match Store::connect(config.store.endpoint.clone()).await {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::warn!(%error, "moni-store unavailable; coverage will be reported missing");
+                None
+            }
+        };
+        let books = Arc::new(RwLock::new(HashMap::new()));
+        let (target_sender, target_receiver) = watch::channel(BTreeSet::new());
+        tokio::spawn(
+            MarketFeed::new(
+                config.clob.ws_endpoint.clone(),
+                target_receiver,
+                books.clone(),
+            )
+            .run(),
+        );
+        Ok(Self {
+            gamma: GammaClient::new(
+                config.discovery.gamma_endpoint.clone(),
+                config.discovery.page_limit,
+                config.discovery.max_pages,
+            ),
+            rest: RestClient::new(
+                config.clob.rest_endpoint.clone(),
+                config.clob.market_info_endpoint.clone(),
+                config.quality.rest_timeout_ms,
+            ),
+            gates: GateState::load(&config.state.gate_state_path)?,
+            config,
+            observe_only,
+            submitter,
+            monitor,
+            store,
+            target_sender,
+            books,
+            circuits: CircuitState::default(),
+            episodes: EpisodeTracker::default(),
+            submitted: BTreeMap::new(),
+            daily_loss_halted: false,
+        })
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            self.config.discovery.refresh_interval_secs,
+        ));
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    self.gates.save(&self.config.state.gate_state_path)?;
+                    return Ok(());
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = self.iteration(None).await {
+                        tracing::warn!(%error, "strategy-beta evaluation cycle failed");
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn diagnostic_once(mut self, market_filter: &str) -> Result<()> {
+        self.iteration(Some(market_filter)).await
+    }
+
+    async fn iteration(&mut self, market_filter: Option<&str>) -> Result<()> {
+        let now_ms = now_millis();
+        self.reconcile_monitor().await?;
+        let markets = self
+            .gamma
+            .discover(now_ms, self.config.discovery.max_horizon_ms)
+            .await?;
+        let targets = markets
+            .iter()
+            .filter(|market| market.subscribable(now_ms, self.config.discovery.max_horizon_ms))
+            .flat_map(|market| {
+                market
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.token_id.clone())
+            })
+            .collect();
+        self.target_sender
+            .send(targets)
+            .context("updating CLOB target subscriptions")?;
+
+        for market in markets
+            .iter()
+            .filter(|market| market_filter.is_none_or(|filter| market.market_id == filter))
+        {
+            if !market.subscribable(now_ms, self.config.discovery.max_horizon_ms) {
+                self.log_decision(market, None, false, "market_not_subscribable", None, None)?;
+                continue;
+            }
+            if let Err(error) = self.evaluate_market(market, now_ms).await {
+                self.episodes.close_market(&market.market_id);
+                if let Some(bucket) =
+                    DurationBucket::from_remaining_ms(market.end_time_ms.saturating_sub(now_ms))
+                {
+                    for direction in [Direction::BuyMerge, Direction::SplitSell] {
+                        self.gates
+                            .relock(GateKey { direction, bucket }, "invalid_data");
+                    }
+                }
+                self.log_decision(
+                    market,
+                    None,
+                    false,
+                    &format!("rejected:{error}"),
+                    None,
+                    None,
+                )?;
+            }
+        }
+        self.gates.save(&self.config.state.gate_state_path)?;
+        Ok(())
+    }
+
+    async fn evaluate_market(&mut self, market: &BinaryCryptoMarket, now_ms: i64) -> Result<()> {
+        let info = self.rest.market_info(&market.condition_id).await?;
+        let expected_tokens = market
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.token_id.clone())
+            .collect::<BTreeSet<_>>();
+        if info.token_ids.into_iter().collect::<BTreeSet<_>>() != expected_tokens {
+            bail!("Gamma/CLOB token mapping mismatch");
+        }
+        if info.tick_size != market.tick_size {
+            bail!("Gamma/CLOB tick size mismatch");
+        }
+        if !info.accepting_orders {
+            bail!("CLOB market is not accepting orders");
+        }
+        let fees = validate_fee_metadata(
+            market.gamma_fee_rate,
+            market.gamma_fee_exponent,
+            market.gamma_fee_taker_only,
+            info.fee_rate,
+            info.fee_exponent,
+            info.fee_taker_only,
+        )?;
+        let (ws_a, ws_b) = {
+            let books = self.books.read().await;
+            (
+                books
+                    .get(&market.outcomes[0].token_id)
+                    .cloned()
+                    .context("token A WebSocket book missing")?,
+                books
+                    .get(&market.outcomes[1].token_id)
+                    .cloned()
+                    .context("token B WebSocket book missing")?,
+            )
+        };
+        let bucket = DurationBucket::from_remaining_ms(market.end_time_ms.saturating_sub(now_ms))
+            .context("market duration is outside calibration buckets")?;
+        let preliminary = [Direction::BuyMerge, Direction::SplitSell]
+            .into_iter()
+            .filter_map(|direction| {
+                let reserves = effective_reserves(
+                    &self.config.reserves,
+                    self.gates.status(GateKey { direction, bucket }),
+                );
+                best_for_direction(
+                    &ws_a,
+                    &ws_b,
+                    &fees,
+                    direction,
+                    &self.config.profitability,
+                    &reserves,
+                    &self.config.risk,
+                )
+            })
+            .max_by(|left, right| left.net_profit.cmp(&right.net_profit));
+        let Some(preliminary) = preliminary else {
+            self.episodes.close_market(&market.market_id);
+            self.log_decision(market, None, false, "no_profitable_depth", None, None)?;
+            return Ok(());
+        };
+
+        let token_ids = market
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.token_id.clone())
+            .collect::<Vec<_>>();
+        let (rest_books, round_trip_ms) = self.rest.books(&token_ids, now_ms).await?;
+        let rest_a = rest_books
+            .iter()
+            .find(|book| book.token_id == token_ids[0])
+            .context("token A REST book missing")?;
+        let rest_b = rest_books
+            .iter()
+            .find(|book| book.token_id == token_ids[1])
+            .context("token B REST book missing")?;
+        validate_final_books(
+            &ws_a,
+            &ws_b,
+            rest_a,
+            rest_b,
+            preliminary.quantity,
+            preliminary.direction,
+            market.tick_size,
+            now_ms,
+            round_trip_ms,
+            &self.config.quality,
+        )?;
+        let final_reserves = effective_reserves(
+            &self.config.reserves,
+            self.gates.status(GateKey {
+                direction: preliminary.direction,
+                bucket,
+            }),
+        );
+        let final_opportunity = best_for_direction(
+            rest_a,
+            rest_b,
+            &fees,
+            preliminary.direction,
+            &self.config.profitability,
+            &final_reserves,
+            &self.config.risk,
+        )
+        .context("opportunity disappeared in final REST refresh")?;
+
+        self.episodes
+            .close_other_directions(&market.market_id, final_opportunity.direction);
+        let episode = self
+            .episodes
+            .episode(&market.market_id, final_opportunity.direction);
+        let key = GateKey {
+            direction: final_opportunity.direction,
+            bucket,
+        };
+        let sample = CalibrationSample {
+            episode_id: episode,
+            observed_at_ms: now_ms,
+            terminal: true,
+            valid_data: true,
+            unresolved_orphan: false,
+            net_profit: final_opportunity.net_profit,
+            slippage: (preliminary.net_profit - final_opportunity.net_profit).max(Decimal::ZERO),
+            latency_cost: self.config.reserves.latency,
+            orphan_loss: Decimal::ZERO,
+        };
+        if self.gates.record(key, sample.clone()) {
+            append_jsonl(&self.config.state.calibration_log_path, &sample)?;
+        }
+        let gate = self
+            .gates
+            .evaluate(
+                key,
+                now_ms,
+                self.config.calibration.minimum_age_hours,
+                self.config.calibration.minimum_cycles,
+                self.config.calibration.minimum_coverage,
+            )
+            .clone();
+        let (coverage_a, coverage_b) = self.store_coverage(market, now_ms).await;
+        if !gate.unlocked {
+            self.log_decision(
+                market,
+                Some(&final_opportunity),
+                false,
+                "calibration_gate_locked",
+                coverage_a,
+                coverage_b,
+            )?;
+            return Ok(());
+        }
+        if self.observe_only {
+            self.log_decision(
+                market,
+                Some(&final_opportunity),
+                false,
+                "forced_observe_only",
+                coverage_a,
+                coverage_b,
+            )?;
+            return Ok(());
+        }
+        self.check_risk(market, &final_opportunity)?;
+        self.circuits.can_start(
+            &market.market_id,
+            final_opportunity.direction,
+            now_ms,
+            self.config.risk.signals_per_minute,
+        )?;
+        let signal_id = stable_signal_id(market, &final_opportunity, rest_a, rest_b);
+        let outcome = self
+            .submitter
+            .submit(request(
+                signal_id.clone(),
+                &self.config.link.strategy_id,
+                &self.config.link.source,
+                market,
+                &final_opportunity,
+                rest_a.updated_at_ms,
+                rest_b.updated_at_ms,
+                now_ms,
+            ))
+            .await?;
+        match outcome {
+            SubmitOutcome::Accepted | SubmitOutcome::Duplicate => {
+                self.circuits.started(
+                    market.market_id.clone(),
+                    final_opportunity.direction,
+                    now_ms,
+                );
+                self.submitted.insert(
+                    signal_id,
+                    (
+                        market.market_id.clone(),
+                        final_opportunity.direction,
+                        final_opportunity.capital,
+                        market.underlying.clone(),
+                    ),
+                );
+                self.log_decision(
+                    market,
+                    Some(&final_opportunity),
+                    true,
+                    "submitted",
+                    coverage_a,
+                    coverage_b,
+                )?;
+            }
+            SubmitOutcome::Rejected(reason) | SubmitOutcome::Retriable(reason) => {
+                self.log_decision(
+                    market,
+                    Some(&final_opportunity),
+                    false,
+                    &reason,
+                    coverage_a,
+                    coverage_b,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_risk(&self, market: &BinaryCryptoMarket, opportunity: &Opportunity) -> Result<()> {
+        if self.daily_loss_halted {
+            bail!("daily loss circuit breaker is active");
+        }
+        let market_exposure: Decimal = self
+            .submitted
+            .values()
+            .filter(|(market_id, _, _, _)| market_id == &market.market_id)
+            .map(|(_, _, capital, _)| *capital)
+            .sum();
+        let underlying_exposure: Decimal = self
+            .submitted
+            .values()
+            .filter(|(_, _, _, underlying)| underlying == &market.underlying)
+            .map(|(_, _, capital, _)| *capital)
+            .sum();
+        let aggregate: Decimal = self
+            .submitted
+            .values()
+            .map(|(_, _, capital, _)| *capital)
+            .sum();
+        if opportunity.capital > self.config.risk.max_per_cycle
+            || market_exposure + opportunity.capital > self.config.risk.max_per_market
+            || underlying_exposure + opportunity.capital > self.config.risk.max_per_underlying
+            || aggregate + opportunity.capital > self.config.risk.max_aggregate
+            || self.config.reserves.orphan > self.config.risk.max_orphan_loss
+        {
+            bail!("strategy risk limit rejected the cycle");
+        }
+        Ok(())
+    }
+
+    async fn reconcile_monitor(&mut self) -> Result<()> {
+        let executions = self
+            .monitor
+            .executions(&self.config.link.strategy_id, 1_000)
+            .await?;
+        let mut unresolved_orphan = false;
+        let now_ms = now_millis();
+        let day_start_ms = now_ms.saturating_sub(86_400_000);
+        let mut daily_profit = Decimal::ZERO;
+        for execution in executions {
+            if execution.completed_at_ms >= day_start_ms
+                && let Ok(realized) = execution.realized_profit.parse::<Decimal>()
+            {
+                daily_profit += realized;
+            }
+            if matches!(execution.state.as_str(), "recovering" | "unknown")
+                || execution.recovery_action == "halted"
+            {
+                unresolved_orphan = true;
+            }
+            if matches!(
+                execution.state.as_str(),
+                "completed" | "failed" | "risk_rejected"
+            ) && let Some((market_id, direction, _, _)) =
+                self.submitted.remove(&execution.signal_id)
+            {
+                self.circuits.terminal(&market_id, direction);
+            }
+        }
+        self.circuits.set_unresolved_orphan(unresolved_orphan);
+        self.daily_loss_halted = daily_profit <= -self.config.risk.daily_loss_limit;
+        if unresolved_orphan {
+            self.gates.relock_all("unresolved_orphan");
+        } else if self.daily_loss_halted {
+            self.gates.relock_all("daily_loss_limit");
+        }
+        Ok(())
+    }
+
+    async fn store_coverage(
+        &mut self,
+        market: &BinaryCryptoMarket,
+        now_ms: i64,
+    ) -> (Option<bool>, Option<bool>) {
+        let Some(store) = self.store.as_mut() else {
+            return (Some(false), Some(false));
+        };
+        let a = store
+            .has_recent_snapshot(
+                &market.outcomes[0].token_id,
+                now_ms,
+                self.config.store.snapshot_max_age_ms,
+            )
+            .await
+            .ok();
+        let b = store
+            .has_recent_snapshot(
+                &market.outcomes[1].token_id,
+                now_ms,
+                self.config.store.snapshot_max_age_ms,
+            )
+            .await
+            .ok();
+        (a, b)
+    }
+
+    fn log_decision(
+        &self,
+        market: &BinaryCryptoMarket,
+        opportunity: Option<&Opportunity>,
+        submitted: bool,
+        reason: &str,
+        coverage_a: Option<bool>,
+        coverage_b: Option<bool>,
+    ) -> Result<()> {
+        append_jsonl(
+            &self.config.state.decision_log_path,
+            &Decision {
+                observed_at_ms: now_millis(),
+                market_id: market.market_id.clone(),
+                direction: opportunity.map(|value| value.direction),
+                quantity: opportunity.map(|value| value.quantity),
+                expected_profit: opportunity.map(|value| value.net_profit),
+                gate_unlocked: opportunity
+                    .and_then(|value| {
+                        DurationBucket::from_remaining_ms(
+                            market.end_time_ms.saturating_sub(now_millis()),
+                        )
+                        .and_then(|bucket| {
+                            self.gates.status(GateKey {
+                                direction: value.direction,
+                                bucket,
+                            })
+                        })
+                    })
+                    .is_some_and(|status| status.unlocked),
+                submitted,
+                reason: reason.to_owned(),
+                store_coverage_a: coverage_a,
+                store_coverage_b: coverage_b,
+            },
+        )
+    }
+}
+
+fn stable_signal_id(
+    market: &BinaryCryptoMarket,
+    opportunity: &Opportunity,
+    book_a: &Book,
+    book_b: &Book,
+) -> String {
+    let raw = format!(
+        "{}:{}:{}:{}:{}",
+        market.market_id,
+        direction_label(opportunity.direction),
+        opportunity.quantity,
+        book_a.updated_at_ms,
+        book_b.updated_at_ms
+    );
+    format!("beta:{}", hex::encode(Sha256::digest(raw.as_bytes())))
+}
+
+fn direction_label(direction: Direction) -> &'static str {
+    match direction {
+        Direction::BuyMerge => "buy_merge",
+        Direction::SplitSell => "split_sell",
+    }
+}
+
+fn effective_reserves(
+    configured: &crate::config::ReserveConfig,
+    gate: Option<&crate::gate::GateStatus>,
+) -> crate::config::ReserveConfig {
+    let Some(gate) = gate else {
+        return configured.clone();
+    };
+    crate::config::ReserveConfig {
+        slippage_bps: configured.slippage_bps,
+        latency: configured.latency + gate.reserves.slippage_p99 + gate.reserves.latency_p99,
+        orphan: configured.orphan.max(gate.reserves.orphan_p99),
+        rounding_scale: configured.rounding_scale,
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}

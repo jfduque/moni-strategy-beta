@@ -1,0 +1,64 @@
+[link]
+endpoint = "http://10.0.3.10:50053"
+strategy_id = "strategy-beta"
+source = "moni-strategy-beta"
+
+[monitor]
+endpoint = "http://10.0.3.10:50051"
+tenant_id = "tenant-strategy-beta"
+api_key_env = "MONI_BETA_MONITOR_KEY"
+poll_interval_ms = 1000
+
+[store]
+endpoint = "http://10.0.3.13:50054"
+snapshot_max_age_ms = 60000
+
+[discovery]
+gamma_endpoint = "https://gamma-api.polymarket.com/events"
+page_limit = 100
+max_pages = 30
+max_horizon_ms = 86400000
+refresh_interval_secs = 30
+
+[clob]
+ws_endpoint = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rest_endpoint = "https://clob.polymarket.com/books"
+market_info_endpoint = "https://clob.polymarket.com"
+
+[quality]
+max_book_age_ms = 750
+max_token_skew_ms = 250
+max_tick_disagreement = 1
+rest_timeout_ms = 500
+max_rest_round_trip_ms = 500
+
+[profitability]
+minimum_profit = "0.10"
+minimum_return_bps = "200"
+depth_fraction = "0.25"
+
+[reserves]
+slippage_bps = "10"
+latency = "0.01"
+orphan = "0.02"
+rounding_scale = 6
+
+[risk]
+max_per_cycle = "5"
+max_per_market = "8"
+max_per_underlying = "10"
+max_aggregate = "20"
+max_orphan_loss = "0.50"
+max_unmatched_inventory = "5"
+daily_loss_limit = "10"
+signals_per_minute = 10
+
+[calibration]
+minimum_age_hours = 24
+minimum_cycles = 100
+minimum_coverage = "0.99"
+
+[state]
+decision_log_path = "/var/lib/moni-strategy-beta/decisions.jsonl"
+calibration_log_path = "/var/lib/moni-strategy-beta/calibration.jsonl"
+gate_state_path = "/var/lib/moni-strategy-beta/gates.json"

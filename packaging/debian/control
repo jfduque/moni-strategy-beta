@@ -1,0 +1,9 @@
+Package: moni-strategy-beta
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: moni operators <ops@example.invalid>
+Depends: libc6, systemd
+Description: Polymarket crypto complete-set signal daemon
+ Credential-free signal daemon for fee-aware complete-set opportunities.

@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if ! getent group moni-strategy-beta >/dev/null; then
+    addgroup --system moni-strategy-beta
+fi
+if ! getent passwd moni-strategy-beta >/dev/null; then
+    adduser --system --ingroup moni-strategy-beta --home /var/lib/moni-strategy-beta \
+        --no-create-home --shell /usr/sbin/nologin moni-strategy-beta
+fi
+install -d -o moni-strategy-beta -g moni-strategy-beta -m 0750 /var/lib/moni-strategy-beta
+install -d -o root -g moni-strategy-beta -m 0750 /etc/moni-strategy-beta
+systemctl daemon-reload

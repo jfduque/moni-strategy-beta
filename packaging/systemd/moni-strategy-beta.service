@@ -1,0 +1,23 @@
+[Unit]
+Description=Moni Strategy Beta
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moni-strategy-beta
+Group=moni-strategy-beta
+EnvironmentFile=-/etc/moni-strategy-beta/monitor.env
+ExecStart=/usr/bin/moni-strategy-beta serve --config /etc/moni-strategy-beta/config.toml
+Restart=on-failure
+RestartSec=2
+StateDirectory=moni-strategy-beta
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/moni-strategy-beta
+
+[Install]
+WantedBy=multi-user.target

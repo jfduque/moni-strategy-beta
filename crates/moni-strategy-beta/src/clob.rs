@@ -1,0 +1,451 @@
+use crate::pricing::{Book, Level};
+use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, watch};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+const SUBSCRIPTION_BATCH_SIZE: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketInfo {
+    pub condition_id: String,
+    pub token_ids: Vec<String>,
+    pub fee_rate: Option<Decimal>,
+    pub fee_exponent: Option<i64>,
+    pub fee_taker_only: Option<bool>,
+    pub tick_size: Decimal,
+    pub accepting_orders: bool,
+}
+
+#[derive(Clone)]
+pub struct RestClient {
+    client: reqwest::Client,
+    books_endpoint: String,
+    market_info_endpoint: String,
+}
+
+impl RestClient {
+    pub fn new(books_endpoint: String, market_info_endpoint: String, timeout_ms: u64) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(timeout_ms))
+                .user_agent("moni-strategy-beta/0.1.0")
+                .build()
+                .expect("static CLOB HTTP configuration is valid"),
+            books_endpoint,
+            market_info_endpoint,
+        }
+    }
+
+    pub async fn books(
+        &self,
+        token_ids: &[String],
+        observed_at_ms: i64,
+    ) -> Result<(Vec<Book>, u64)> {
+        let started = Instant::now();
+        let response = self
+            .client
+            .post(&self.books_endpoint)
+            .json(
+                &token_ids
+                    .iter()
+                    .map(|token_id| serde_json::json!({"token_id": token_id}))
+                    .collect::<Vec<_>>(),
+            )
+            .send()
+            .await
+            .context("requesting final CLOB books")?
+            .error_for_status()
+            .context("CLOB books request failed")?;
+        let body = response
+            .text()
+            .await
+            .context("reading CLOB books response")?;
+        Ok((
+            parse_books(&body, observed_at_ms)?,
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        ))
+    }
+
+    pub async fn market_info(&self, condition_id: &str) -> Result<MarketInfo> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/markets/{}",
+                self.market_info_endpoint.trim_end_matches('/'),
+                condition_id
+            ))
+            .send()
+            .await
+            .context("requesting CLOB market info")?
+            .error_for_status()
+            .context("CLOB market info request failed")?;
+        let body = response.text().await.context("reading CLOB market info")?;
+        parse_market_info(&body, condition_id)
+    }
+}
+
+pub fn parse_books(raw: &str, observed_at_ms: i64) -> Result<Vec<Book>> {
+    let values: Vec<Value> = serde_json::from_str(raw).context("parsing CLOB books JSON")?;
+    values
+        .iter()
+        .map(|value| parse_book(value, observed_at_ms))
+        .collect()
+}
+
+pub fn parse_market_info(raw: &str, expected_condition_id: &str) -> Result<MarketInfo> {
+    let value: Value = serde_json::from_str(raw).context("parsing CLOB market info JSON")?;
+    let condition_id = string(&value, &["condition_id", "conditionId", "c"])?;
+    if condition_id != expected_condition_id {
+        bail!("CLOB market info condition id mismatch");
+    }
+    let tokens = value
+        .get("tokens")
+        .or_else(|| value.get("t"))
+        .and_then(Value::as_array)
+        .context("CLOB market info is missing tokens")?;
+    let token_ids = tokens
+        .iter()
+        .map(|token| string(token, &["token_id", "tokenId", "t"]))
+        .collect::<Result<Vec<_>>>()?;
+    let curve = value
+        .get("fee_curve")
+        .or_else(|| value.get("feeCurve"))
+        .or_else(|| value.get("fd"));
+    let fee_rate = curve
+        .and_then(|curve| curve.get("rate").or_else(|| curve.get("r")))
+        .and_then(decimal);
+    let fee_exponent = curve
+        .and_then(|curve| curve.get("exponent").or_else(|| curve.get("e")))
+        .and_then(Value::as_i64);
+    let fee_taker_only = curve
+        .and_then(|curve| {
+            curve
+                .get("taker_only")
+                .or_else(|| curve.get("takerOnly"))
+                .or_else(|| curve.get("t"))
+        })
+        .and_then(Value::as_bool);
+    let tick_size = value
+        .get("minimum_tick_size")
+        .or_else(|| value.get("minimumTickSize"))
+        .or_else(|| value.get("mts"))
+        .and_then(decimal)
+        .context("CLOB market info is missing tick size")?;
+    let accepting_orders = value
+        .get("accepting_orders")
+        .or_else(|| value.get("acceptingOrders"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(MarketInfo {
+        condition_id,
+        token_ids,
+        fee_rate,
+        fee_exponent,
+        fee_taker_only,
+        tick_size,
+        accepting_orders,
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionDiff {
+    pub subscribe: Vec<String>,
+    pub unsubscribe: Vec<String>,
+}
+
+pub fn subscription_diff(
+    current: &BTreeSet<String>,
+    target: &BTreeSet<String>,
+) -> SubscriptionDiff {
+    SubscriptionDiff {
+        subscribe: target.difference(current).cloned().collect(),
+        unsubscribe: current.difference(target).cloned().collect(),
+    }
+}
+
+fn subscription_messages(asset_ids: &[String], operation: Option<&str>) -> Vec<Message> {
+    asset_ids
+        .chunks(SUBSCRIPTION_BATCH_SIZE)
+        .map(|chunk| {
+            let mut value = serde_json::json!({
+                "assets_ids": chunk,
+                "custom_feature_enabled": true,
+            });
+            if let Some(operation) = operation {
+                value["operation"] = Value::String(operation.to_owned());
+            } else {
+                value["type"] = Value::String("market".to_owned());
+            }
+            Message::text(value.to_string())
+        })
+        .collect()
+}
+
+pub struct MarketFeed {
+    endpoint: String,
+    targets: watch::Receiver<BTreeSet<String>>,
+    books: Arc<RwLock<HashMap<String, Book>>>,
+}
+
+impl MarketFeed {
+    pub fn new(
+        endpoint: String,
+        targets: watch::Receiver<BTreeSet<String>>,
+        books: Arc<RwLock<HashMap<String, Book>>>,
+    ) -> Self {
+        Self {
+            endpoint,
+            targets,
+            books,
+        }
+    }
+
+    pub async fn run(mut self) -> ! {
+        let mut attempt = 0_u32;
+        loop {
+            if let Err(error) = self.run_once().await {
+                tracing::warn!(%error, "CLOB market feed disconnected");
+            }
+            let delay = 250_u64.saturating_mul(1_u64 << attempt.min(5)).min(8_000);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    async fn run_once(&mut self) -> Result<()> {
+        let (stream, _) = connect_async(&self.endpoint)
+            .await
+            .context("connecting CLOB market feed")?;
+        let (mut sink, mut stream) = stream.split();
+        let mut subscribed = self.targets.borrow().clone();
+        for message in subscription_messages(&subscribed.iter().cloned().collect::<Vec<_>>(), None)
+        {
+            sink.send(message)
+                .await
+                .context("sending initial subscription")?;
+        }
+        loop {
+            tokio::select! {
+                changed = self.targets.changed() => {
+                    changed.context("CLOB target set channel closed")?;
+                    let target = self.targets.borrow().clone();
+                    let diff = subscription_diff(&subscribed, &target);
+                    for message in subscription_messages(&diff.unsubscribe, Some("unsubscribe")) {
+                        sink.send(message).await.context("sending unsubscribe")?;
+                    }
+                    for message in subscription_messages(&diff.subscribe, Some("subscribe")) {
+                        sink.send(message).await.context("sending subscribe")?;
+                    }
+                    if !diff.unsubscribe.is_empty() {
+                        let mut books = self.books.write().await;
+                        for token in &diff.unsubscribe {
+                            books.remove(token);
+                        }
+                    }
+                    subscribed = target;
+                }
+                frame = stream.next() => {
+                    let Some(frame) = frame else { bail!("CLOB stream closed") };
+                    match frame.context("reading CLOB frame")? {
+                        Message::Text(text) => self.apply_frame(text.as_str(), &subscribed).await,
+                        Message::Ping(payload) => sink.send(Message::Pong(payload)).await?,
+                        Message::Close(_) => bail!("CLOB stream closed"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn apply_frame(&self, raw: &str, subscribed: &BTreeSet<String>) {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return;
+        };
+        let values = value
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(&value));
+        for event in values {
+            let event_type = event.get("event_type").and_then(Value::as_str);
+            if event_type == Some("book") || event.get("bids").is_some() {
+                if let Ok(book) = parse_book(event, now_millis())
+                    && subscribed.contains(&book.token_id)
+                {
+                    self.books.write().await.insert(book.token_id.clone(), book);
+                }
+            } else if event_type == Some("price_change") {
+                self.apply_changes(event, subscribed).await;
+            }
+        }
+    }
+
+    async fn apply_changes(&self, event: &Value, subscribed: &BTreeSet<String>) {
+        let Some(changes) = event
+            .get("price_changes")
+            .or_else(|| event.get("changes"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let mut books = self.books.write().await;
+        for change in changes {
+            let Ok(token_id) = string(change, &["asset_id", "assetId"]) else {
+                continue;
+            };
+            if !subscribed.contains(&token_id) {
+                continue;
+            }
+            let (Some(price), Some(size), Some(side)) = (
+                change.get("price").and_then(decimal),
+                change.get("size").and_then(decimal),
+                change.get("side").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(book) = books.get_mut(&token_id) else {
+                continue;
+            };
+            let levels = if side.eq_ignore_ascii_case("buy") {
+                &mut book.bids
+            } else if side.eq_ignore_ascii_case("sell") {
+                &mut book.asks
+            } else {
+                continue;
+            };
+            levels.retain(|level| level.price != price);
+            if size > Decimal::ZERO {
+                levels.push(Level { price, size });
+            }
+            let _ = book.normalize();
+            book.updated_at_ms = timestamp(event).unwrap_or_else(now_millis);
+        }
+    }
+}
+
+fn parse_book(value: &Value, observed_at_ms: i64) -> Result<Book> {
+    let mut book = Book {
+        market_id: string(value, &["market", "market_id"])?,
+        token_id: string(value, &["asset_id", "token_id"])?,
+        bids: parse_levels(value.get("bids"))?,
+        asks: parse_levels(value.get("asks"))?,
+        updated_at_ms: timestamp(value).unwrap_or(observed_at_ms),
+    };
+    book.normalize()?;
+    Ok(book)
+}
+
+fn parse_levels(value: Option<&Value>) -> Result<Vec<Level>> {
+    value
+        .and_then(Value::as_array)
+        .context("book side is missing")?
+        .iter()
+        .map(|level| {
+            Ok(Level {
+                price: level
+                    .get("price")
+                    .and_then(decimal)
+                    .context("book level price is missing")?,
+                size: level
+                    .get("size")
+                    .and_then(decimal)
+                    .context("book level size is missing")?,
+            })
+        })
+        .collect()
+}
+
+fn timestamp(value: &Value) -> Option<i64> {
+    value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        })
+}
+
+fn string(value: &Value, names: &[&str]) -> Result<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .context("required string is missing")
+}
+
+fn decimal(value: &Value) -> Option<Decimal> {
+    match value {
+        Value::String(value) => Decimal::from_str(value).ok(),
+        Value::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+        _ => None,
+    }
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_subscription_uses_set_difference() {
+        let current = ["1", "2"].into_iter().map(str::to_owned).collect();
+        let target = ["2", "3"].into_iter().map(str::to_owned).collect();
+        let diff = subscription_diff(&current, &target);
+        assert_eq!(diff.unsubscribe, vec!["1"]);
+        assert_eq!(diff.subscribe, vec!["3"]);
+        let unsubscribe = subscription_messages(&diff.unsubscribe, Some("unsubscribe"));
+        assert!(
+            unsubscribe[0]
+                .to_string()
+                .contains("\"operation\":\"unsubscribe\"")
+        );
+    }
+
+    #[test]
+    fn parses_and_sorts_batched_rest_books() {
+        let books = parse_books(
+            r#"[{"market":"m","asset_id":"a","timestamp":"100",
+                "bids":[{"price":"0.4","size":"2"},{"price":"0.5","size":"1"}],
+                "asks":[{"price":"0.7","size":"1"},{"price":"0.6","size":"2"}]}]"#,
+            200,
+        )
+        .unwrap();
+        assert_eq!(books[0].bids[0].price, Decimal::new(5, 1));
+        assert_eq!(books[0].asks[0].price, Decimal::new(6, 1));
+        assert_eq!(books[0].updated_at_ms, 100);
+    }
+
+    #[test]
+    fn market_info_requires_current_fee_and_order_metadata() {
+        let info = parse_market_info(
+            r#"{"condition_id":"c","tokens":[{"token_id":"1"},{"token_id":"2"}],
+                "fee_curve":{"rate":"0.07","exponent":1,"taker_only":true},
+                "minimum_tick_size":"0.01","accepting_orders":true}"#,
+            "c",
+        )
+        .unwrap();
+        assert_eq!(info.fee_rate, Some(Decimal::new(7, 2)));
+        assert_eq!(info.fee_exponent, Some(1));
+        assert_eq!(info.fee_taker_only, Some(true));
+        assert!(info.accepting_orders);
+    }
+}

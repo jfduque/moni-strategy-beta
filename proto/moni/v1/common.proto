@@ -1,0 +1,3 @@
+syntax = "proto3";
+package moni.v1;
+message TenantRef { string tenant_id = 1; }

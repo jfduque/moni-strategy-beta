@@ -1,0 +1,35 @@
+syntax = "proto3";
+package moni.v1;
+import "moni/v1/common.proto";
+
+service Monitor {
+  rpc ListCompleteSetExecutions(ListCompleteSetExecutionsRequest) returns (ListCompleteSetExecutionsResponse);
+}
+
+message ListCompleteSetExecutionsRequest {
+  TenantRef tenant = 1;
+  string strategy_id = 2;
+  string signal_id = 3;
+  bool terminal_only = 4;
+  uint32 limit = 5;
+}
+message CompleteSetLegOutcome {
+  string token_id = 1; string side = 2; string state = 3;
+  string requested_quantity = 4; string filled_quantity = 5;
+  string average_price = 6; string fee = 7; string order_id = 8;
+  string failure_reason = 9; int64 updated_at_ms = 10;
+}
+message CompleteSetExecution {
+  string tenant_id = 1; string strategy_id = 2; string signal_id = 3;
+  string source = 4; string market_id = 5; string condition_id = 6;
+  string direction = 7; string quantity = 8; string state = 9;
+  CompleteSetLegOutcome leg_a = 10; CompleteSetLegOutcome leg_b = 11;
+  string conversion_state = 12; string conversion_tx_id = 13;
+  string recovery_action = 14; string realized_profit = 15;
+  int64 observed_at_ms = 16; int64 created_at_ms = 17;
+  int64 updated_at_ms = 18; int64 completed_at_ms = 19;
+  string failure_reason = 20;
+}
+message ListCompleteSetExecutionsResponse {
+  repeated CompleteSetExecution executions = 1;
+}

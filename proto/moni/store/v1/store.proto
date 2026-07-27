@@ -1,0 +1,14 @@
+syntax = "proto3";
+package moni.store.v1;
+
+service Store {
+  rpc StreamBookSnapshotRange(StreamBookSnapshotRangeRequest) returns (stream BookSnapshot);
+}
+message BookLevel { string price = 1; string size = 2; }
+message BookSnapshot {
+  int64 sampled_at_ms = 1; string market_id = 2; string token_id = 3;
+  int64 book_updated_at_ms = 4; repeated BookLevel bids = 5; repeated BookLevel asks = 6;
+}
+message StreamBookSnapshotRangeRequest {
+  string token_id = 1; int64 from_ms = 2; int64 to_ms = 3;
+}
