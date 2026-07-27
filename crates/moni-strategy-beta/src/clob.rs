@@ -77,11 +77,7 @@ impl RestClient {
     pub async fn market_info(&self, condition_id: &str) -> Result<MarketInfo> {
         let response = self
             .client
-            .get(format!(
-                "{}/markets/{}",
-                self.market_info_endpoint.trim_end_matches('/'),
-                condition_id
-            ))
+            .get(market_info_url(&self.market_info_endpoint, condition_id))
             .send()
             .await
             .context("requesting CLOB market info")?
@@ -90,6 +86,14 @@ impl RestClient {
         let body = response.text().await.context("reading CLOB market info")?;
         parse_market_info(&body, condition_id)
     }
+}
+
+fn market_info_url(endpoint: &str, condition_id: &str) -> String {
+    format!(
+        "{}/clob-markets/{}",
+        endpoint.trim_end_matches('/'),
+        condition_id
+    )
 }
 
 pub fn parse_books(raw: &str, observed_at_ms: i64) -> Result<Vec<Book>> {
@@ -130,6 +134,7 @@ pub fn parse_market_info(raw: &str, expected_condition_id: &str) -> Result<Marke
             curve
                 .get("taker_only")
                 .or_else(|| curve.get("takerOnly"))
+                .or_else(|| curve.get("to"))
                 .or_else(|| curve.get("t"))
         })
         .and_then(Value::as_bool);
@@ -142,6 +147,7 @@ pub fn parse_market_info(raw: &str, expected_condition_id: &str) -> Result<Marke
     let accepting_orders = value
         .get("accepting_orders")
         .or_else(|| value.get("acceptingOrders"))
+        .or_else(|| value.get("ao"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     Ok(MarketInfo {
@@ -437,9 +443,8 @@ mod tests {
     #[test]
     fn market_info_requires_current_fee_and_order_metadata() {
         let info = parse_market_info(
-            r#"{"condition_id":"c","tokens":[{"token_id":"1"},{"token_id":"2"}],
-                "fee_curve":{"rate":"0.07","exponent":1,"taker_only":true},
-                "minimum_tick_size":"0.01","accepting_orders":true}"#,
+            r#"{"c":"c","t":[{"t":"1","o":"Yes"},{"t":"2","o":"No"}],
+                "fd":{"r":0.07,"e":1,"to":true},"mts":0.01,"ao":true}"#,
             "c",
         )
         .unwrap();
@@ -447,5 +452,13 @@ mod tests {
         assert_eq!(info.fee_exponent, Some(1));
         assert_eq!(info.fee_taker_only, Some(true));
         assert!(info.accepting_orders);
+    }
+
+    #[test]
+    fn market_info_uses_current_clob_market_path() {
+        assert_eq!(
+            market_info_url("https://clob.polymarket.com/", "condition-a"),
+            "https://clob.polymarket.com/clob-markets/condition-a"
+        );
     }
 }
