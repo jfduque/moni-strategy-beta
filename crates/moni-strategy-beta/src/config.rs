@@ -93,6 +93,12 @@ impl RuntimeConfig {
         {
             bail!("profitability.depth_fraction must be in (0, 1]");
         }
+        if self.profitability.price_band_low_max <= Decimal::ZERO
+            || self.profitability.price_band_high_min >= Decimal::ONE
+            || self.profitability.price_band_low_max >= self.profitability.price_band_high_min
+        {
+            bail!("profitability.price_band_low_max must be < price_band_high_min, within (0, 1)");
+        }
         if self.risk.max_per_cycle <= Decimal::ZERO
             || self.risk.max_per_market <= Decimal::ZERO
             || self.risk.max_per_underlying <= Decimal::ZERO
@@ -201,6 +207,18 @@ pub struct ProfitabilityConfig {
     pub minimum_profit: Decimal,
     pub minimum_return_bps: Decimal,
     pub depth_fraction: Decimal,
+    #[serde(default = "default_price_band_low_max")]
+    pub price_band_low_max: Decimal,
+    #[serde(default = "default_price_band_high_min")]
+    pub price_band_high_min: Decimal,
+}
+
+fn default_price_band_low_max() -> Decimal {
+    Decimal::new(15, 2)
+}
+
+fn default_price_band_high_min() -> Decimal {
+    Decimal::new(85, 2)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -280,6 +298,8 @@ max_rest_round_trip_ms = 500
 minimum_profit = "0.10"
 minimum_return_bps = "200"
 depth_fraction = "0.25"
+price_band_low_max = "0.15"
+price_band_high_min = "0.85"
 [reserves]
 slippage_bps = "10"
 latency = "0.01"
@@ -312,6 +332,29 @@ gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
     }
 
     #[test]
+    fn price_band_defaults_for_existing_configs() {
+        let raw = VALID
+            .replace("price_band_low_max = \"0.15\"\n", "")
+            .replace("price_band_high_min = \"0.85\"\n", "");
+        let config = RuntimeConfig::from_toml_str(&raw).unwrap();
+
+        assert_eq!(config.profitability.price_band_low_max, Decimal::new(15, 2));
+        assert_eq!(
+            config.profitability.price_band_high_min,
+            Decimal::new(85, 2)
+        );
+    }
+
+    #[test]
+    fn rejects_inverted_price_band() {
+        let raw = VALID.replace(
+            "price_band_low_max = \"0.15\"",
+            "price_band_low_max = \"0.90\"",
+        );
+        assert!(RuntimeConfig::from_toml_str(&raw).is_err());
+    }
+
+    #[test]
     fn clob_shard_limits_default_for_existing_configs() {
         let raw = VALID
             .replace("max_assets_per_connection = 500\n", "")
@@ -325,6 +368,18 @@ gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
     #[test]
     fn rejects_subscription_baseline_drift() {
         let raw = VALID.replace("max_pages = 30", "max_pages = 0");
+        assert!(RuntimeConfig::from_toml_str(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_decision_database_path() {
+        let raw = VALID.replace("/var/lib/moni-strategy-beta/decisions.sqlite3", "");
+        assert!(RuntimeConfig::from_toml_str(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_decision_log_key() {
+        let raw = VALID.replace("decision_db_path", "decision_log_path");
         assert!(RuntimeConfig::from_toml_str(&raw).is_err());
     }
 }

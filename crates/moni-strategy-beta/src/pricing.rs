@@ -170,6 +170,16 @@ pub fn best_for_direction(
     };
     let levels_a = levels(book_a, side);
     let levels_b = levels(book_b, side);
+    let top_price = levels_a.first()?.price;
+    if top_price > profitability.price_band_low_max && top_price < profitability.price_band_high_min
+    {
+        // Polymarket's taker fee is rate * price * (1 - price), which peaks at the
+        // 50c coinflip point. Inside the band, round-trip fees alone (~350bps at
+        // 50c for a 7% category) exceed any realistic complete-set mispricing, so
+        // no minimum_return_bps value could ever clear here — skip without paying
+        // for the REST cross-check.
+        return None;
+    }
     let common_depth = total_depth(levels_a).min(total_depth(levels_b));
     let participation_cap = common_depth * profitability.depth_fraction;
     if participation_cap <= Decimal::ZERO {
@@ -366,6 +376,65 @@ mod tests {
             orphan: Decimal::ZERO,
             rounding_scale: 6,
         }
+    }
+
+    fn profitability() -> ProfitabilityConfig {
+        ProfitabilityConfig {
+            minimum_profit: Decimal::ZERO,
+            minimum_return_bps: Decimal::ZERO,
+            depth_fraction: Decimal::ONE,
+            price_band_low_max: d("0.15"),
+            price_band_high_min: d("0.85"),
+        }
+    }
+
+    fn risk() -> RiskConfig {
+        RiskConfig {
+            max_per_cycle: d("1000"),
+            max_per_market: d("1000"),
+            max_per_underlying: d("1000"),
+            max_aggregate: d("1000"),
+            max_orphan_loss: d("1000"),
+            max_unmatched_inventory: d("1000"),
+            daily_loss_limit: d("1000"),
+            signals_per_minute: 100,
+        }
+    }
+
+    #[test]
+    fn price_band_skips_coinflip_prices_but_allows_extremes() {
+        let fees = FeeSchedule {
+            rate: Decimal::ZERO,
+        };
+        let in_band_a = book("a", &[], &[("0.48", "10")], 100);
+        let in_band_b = book("b", &[], &[("0.48", "10")], 100);
+        assert!(
+            best_for_direction(
+                &in_band_a,
+                &in_band_b,
+                &fees,
+                Direction::BuyMerge,
+                &profitability(),
+                &reserves(),
+                &risk(),
+            )
+            .is_none()
+        );
+
+        let extreme_a = book("a", &[], &[("0.05", "10")], 100);
+        let extreme_b = book("b", &[], &[("0.05", "10")], 100);
+        assert!(
+            best_for_direction(
+                &extreme_a,
+                &extreme_b,
+                &fees,
+                Direction::BuyMerge,
+                &profitability(),
+                &reserves(),
+                &risk(),
+            )
+            .is_some()
+        );
     }
 
     #[test]
