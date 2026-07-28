@@ -12,6 +12,16 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const SUBSCRIPTION_BATCH_SIZE: usize = 200;
+/// Upper bound on the market-feed reconnect delay. Deliberately low:
+/// Polymarket's edge resets market sockets constantly, so what drives book
+/// staleness is recovery time, not retry volume — every second spent backing
+/// off is a second of stale book.
+const RECONNECT_DELAY_MAX: Duration = Duration::from_millis(5_000);
+/// How long a connection must stay up before its reconnect backoff counts as
+/// recovered. Without it the attempt counter only ever grows, so a handful of
+/// early drops pin the feed at the maximum delay for the life of the process
+/// even once the venue is healthy again.
+const STABLE_CONNECTION: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketInfo {
@@ -317,16 +327,19 @@ impl MarketFeed {
     pub async fn run(mut self) -> ! {
         let mut attempt = 0_u32;
         loop {
-            if let Err(error) = self.run_once().await {
+            let mut connected_at = None;
+            if let Err(error) = self.run_once(&mut connected_at).await {
                 tracing::warn!(%error, "CLOB market feed disconnected");
             }
-            let delay = 250_u64.saturating_mul(1_u64 << attempt.min(5)).min(8_000);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            if connected_at.is_some_and(|at: Instant| at.elapsed() >= STABLE_CONNECTION) {
+                attempt = 0;
+            }
+            tokio::time::sleep(reconnect_delay(attempt)).await;
             attempt = attempt.saturating_add(1);
         }
     }
 
-    async fn run_once(&mut self) -> Result<()> {
+    async fn run_once(&mut self, connected_at: &mut Option<Instant>) -> Result<()> {
         while self.targets.borrow().is_empty() {
             self.targets
                 .changed()
@@ -336,6 +349,7 @@ impl MarketFeed {
         let (stream, _) = connect_async(&self.endpoint)
             .await
             .context("connecting CLOB market feed")?;
+        *connected_at = Some(Instant::now());
         let (mut sink, mut stream) = stream.split();
         let mut subscribed = self.targets.borrow().clone();
         for message in subscription_messages(&subscribed.iter().cloned().collect::<Vec<_>>(), None)
@@ -518,9 +532,37 @@ fn now_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+/// Jittered exponential backoff for market-feed reconnects: doubles per
+/// attempt from 250ms, capped at [`RECONNECT_DELAY_MAX`], then randomized to
+/// 50-100% of that value. The jitter matters because the shards drop together
+/// when the venue resets connections — without it they all retry in lockstep.
+fn reconnect_delay(attempt: u32) -> Duration {
+    let base = Duration::from_millis(250)
+        .saturating_mul(1_u32 << attempt.min(5))
+        .min(RECONNECT_DELAY_MAX);
+    let jitter_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    base.mul_f64(0.5 + 0.5 * (jitter_nanos % 1000) as f64 / 1000.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_delay_grows_and_caps_with_jitter() {
+        for attempt in 0..8 {
+            let delay = reconnect_delay(attempt);
+            let base = Duration::from_millis(250)
+                .saturating_mul(1_u32 << attempt.min(5))
+                .min(RECONNECT_DELAY_MAX);
+            assert!(delay >= base / 2, "attempt {attempt}: {delay:?} < half base");
+            assert!(delay <= base, "attempt {attempt}: {delay:?} over base");
+        }
+        assert!(reconnect_delay(20) <= RECONNECT_DELAY_MAX);
+    }
 
     #[test]
     fn dynamic_subscription_uses_set_difference() {
