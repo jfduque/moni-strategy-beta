@@ -1,6 +1,7 @@
 use crate::clients::Monitor;
 use crate::clob::{RestClient, spawn_sharded_market_feed};
 use crate::config::RuntimeConfig;
+use crate::decision_store::DecisionStore;
 use crate::gamma::{BinaryCryptoMarket, GammaClient};
 use crate::gate::{
     CalibrationSample, CircuitState, DurationBucket, GateKey, GateState, append_jsonl,
@@ -82,6 +83,7 @@ pub struct StrategyService {
     monitor: Monitor,
     target_sender: watch::Sender<Vec<String>>,
     books: Arc<RwLock<HashMap<String, Book>>>,
+    decisions: DecisionStore,
     gates: GateState,
     circuits: CircuitState,
     episodes: EpisodeTracker,
@@ -123,6 +125,7 @@ impl StrategyService {
                 config.quality.rest_timeout_ms,
             ),
             gates: GateState::load(&config.state.gate_state_path)?,
+            decisions: DecisionStore::open(&config.state.decision_db_path)?,
             config,
             observe_only,
             submitter,
@@ -507,42 +510,39 @@ impl StrategyService {
         coverage_a: Option<bool>,
         coverage_b: Option<bool>,
     ) -> Result<()> {
-        append_jsonl(
-            &self.config.state.decision_log_path,
-            &Decision {
-                observed_at_ms: now_millis(),
-                market_id: market.market_id.clone(),
-                condition_id: Some(market.condition_id.clone()),
-                token_id_a: market
-                    .outcomes
-                    .first()
-                    .map(|outcome| outcome.token_id.clone()),
-                token_id_b: market
-                    .outcomes
-                    .get(1)
-                    .map(|outcome| outcome.token_id.clone()),
-                direction: opportunity.map(|value| value.direction),
-                quantity: opportunity.map(|value| value.quantity),
-                expected_profit: opportunity.map(|value| value.net_profit),
-                gate_unlocked: opportunity
-                    .and_then(|value| {
-                        DurationBucket::from_remaining_ms(
-                            market.end_time_ms.saturating_sub(now_millis()),
-                        )
-                        .and_then(|bucket| {
-                            self.gates.status(GateKey {
-                                direction: value.direction,
-                                bucket,
-                            })
+        self.decisions.append(&Decision {
+            observed_at_ms: now_millis(),
+            market_id: market.market_id.clone(),
+            condition_id: Some(market.condition_id.clone()),
+            token_id_a: market
+                .outcomes
+                .first()
+                .map(|outcome| outcome.token_id.clone()),
+            token_id_b: market
+                .outcomes
+                .get(1)
+                .map(|outcome| outcome.token_id.clone()),
+            direction: opportunity.map(|value| value.direction),
+            quantity: opportunity.map(|value| value.quantity),
+            expected_profit: opportunity.map(|value| value.net_profit),
+            gate_unlocked: opportunity
+                .and_then(|value| {
+                    DurationBucket::from_remaining_ms(
+                        market.end_time_ms.saturating_sub(now_millis()),
+                    )
+                    .and_then(|bucket| {
+                        self.gates.status(GateKey {
+                            direction: value.direction,
+                            bucket,
                         })
                     })
-                    .is_some_and(|status| status.unlocked),
-                submitted,
-                reason: reason.to_owned(),
-                store_coverage_a: coverage_a,
-                store_coverage_b: coverage_b,
-            },
-        )
+                })
+                .is_some_and(|status| status.unlocked),
+            submitted,
+            reason: reason.to_owned(),
+            store_coverage_a: coverage_a,
+            store_coverage_b: coverage_b,
+        })
     }
 }
 

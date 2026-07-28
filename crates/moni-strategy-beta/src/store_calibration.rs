@@ -1,6 +1,6 @@
 use crate::clients::Store;
 use crate::config::RuntimeConfig;
-use crate::service::Decision;
+use crate::decision_store::{CalibrationRow, DecisionStore};
 use anyhow::{Context, Result};
 use moni_proto::store::v1::BookSnapshot;
 use std::collections::{BTreeSet, HashMap};
@@ -18,102 +18,103 @@ pub struct Summary {
 }
 
 pub async fn summarize_config(config: &RuntimeConfig) -> Result<Summary> {
-    let raw = std::fs::read_to_string(&config.state.decision_log_path)
-        .with_context(|| format!("reading {}", config.state.decision_log_path))?;
-    let decisions = raw
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str::<Decision>(line)
-                .with_context(|| format!("parsing decision line {}", index + 1))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let eligible = decisions
-        .iter()
-        .filter_map(|decision| {
-            Some((
-                decision.observed_at_ms,
-                decision.token_id_a.as_ref()?,
-                decision.token_id_b.as_ref()?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    if eligible.is_empty() {
-        return Ok(summarize(
-            &decisions,
-            &HashMap::new(),
-            config.store.snapshot_max_age_ms,
-        ));
-    }
+    let store_path = &config.state.decision_db_path;
+    let decisions =
+        DecisionStore::open(store_path).with_context(|| format!("opening {store_path}"))?;
+    let scope = decisions
+        .calibration_scope()
+        .with_context(|| format!("reading {store_path}"))?;
 
-    let from_ms = eligible
-        .iter()
-        .map(|(observed_at, _, _)| {
-            observed_at.saturating_sub(config.store.snapshot_max_age_ms as i64)
+    let snapshots = match scope {
+        None => HashMap::new(),
+        Some(scope) => {
+            let from_ms = scope
+                .earliest_ms
+                .saturating_sub(config.store.snapshot_max_age_ms as i64);
+            let token_ids = scope.token_ids.into_iter().collect::<BTreeSet<_>>();
+            let mut store = Store::connect(config.store.endpoint.clone()).await?;
+            let rows = store
+                .snapshots(token_ids.into_iter().collect(), from_ms, scope.latest_ms)
+                .await?;
+            let mut snapshots = HashMap::<String, Vec<BookSnapshot>>::new();
+            for row in rows {
+                snapshots.entry(row.token_id.clone()).or_default().push(row);
+            }
+            snapshots
+        }
+    };
+
+    // Streamed rather than collected: the live table outgrows the container's
+    // memory long before this command is worth running.
+    let mut accumulator = Accumulator::default();
+    decisions
+        .for_each_calibration_row(|row| {
+            accumulator.observe(&row, &snapshots, config.store.snapshot_max_age_ms)
         })
-        .min()
-        .unwrap_or_default();
-    let to_ms = eligible
-        .iter()
-        .map(|(observed_at, _, _)| *observed_at)
-        .max()
-        .unwrap_or(from_ms);
-    let token_ids = eligible
-        .iter()
-        .flat_map(|(_, token_a, token_b)| [(*token_a).clone(), (*token_b).clone()])
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let mut store = Store::connect(config.store.endpoint.clone()).await?;
-    let rows = store.snapshots(token_ids, from_ms, to_ms).await?;
-    let mut snapshots = HashMap::<String, Vec<BookSnapshot>>::new();
-    for row in rows {
-        snapshots.entry(row.token_id.clone()).or_default().push(row);
-    }
-    Ok(summarize(
-        &decisions,
-        &snapshots,
-        config.store.snapshot_max_age_ms,
-    ))
+        .with_context(|| format!("reading {store_path}"))?;
+    Ok(accumulator.finish())
 }
 
+#[derive(Default)]
+struct Accumulator {
+    summary: Summary,
+    ages: Vec<f64>,
+    spreads: Vec<f64>,
+}
+
+impl Accumulator {
+    fn observe(
+        &mut self,
+        row: &CalibrationRow,
+        snapshots: &HashMap<String, Vec<BookSnapshot>>,
+        max_age_ms: u64,
+    ) {
+        self.summary.decisions = self.summary.decisions.saturating_add(1);
+        let (Some(token_a), Some(token_b)) = (&row.token_id_a, &row.token_id_b) else {
+            self.summary.legacy_decisions = self.summary.legacy_decisions.saturating_add(1);
+            return;
+        };
+        self.summary.eligible_decisions = self.summary.eligible_decisions.saturating_add(1);
+        let a = preceding_snapshot(snapshots.get(token_a), row.observed_at_ms, max_age_ms);
+        let b = preceding_snapshot(snapshots.get(token_b), row.observed_at_ms, max_age_ms);
+        match (a.is_some(), b.is_some()) {
+            (true, true) => {
+                self.summary.both_legs_covered = self.summary.both_legs_covered.saturating_add(1)
+            }
+            (true, false) | (false, true) => {
+                self.summary.one_leg_covered = self.summary.one_leg_covered.saturating_add(1)
+            }
+            (false, false) => {
+                self.summary.no_legs_covered = self.summary.no_legs_covered.saturating_add(1)
+            }
+        }
+        for snapshot in [a, b].into_iter().flatten() {
+            self.ages
+                .push((row.observed_at_ms - snapshot.sampled_at_ms) as f64);
+            if let Some(spread) = spread(snapshot) {
+                self.spreads.push(spread);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Summary {
+        self.summary.median_snapshot_age_ms = median(&mut self.ages);
+        self.summary.median_spread = median(&mut self.spreads);
+        self.summary
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn summarize(
-    decisions: &[Decision],
+    rows: &[CalibrationRow],
     snapshots: &HashMap<String, Vec<BookSnapshot>>,
     max_age_ms: u64,
 ) -> Summary {
-    let mut summary = Summary {
-        decisions: decisions.len() as u64,
-        ..Summary::default()
-    };
-    let mut ages = Vec::new();
-    let mut spreads = Vec::new();
-    for decision in decisions {
-        let (Some(token_a), Some(token_b)) = (&decision.token_id_a, &decision.token_id_b) else {
-            summary.legacy_decisions = summary.legacy_decisions.saturating_add(1);
-            continue;
-        };
-        summary.eligible_decisions = summary.eligible_decisions.saturating_add(1);
-        let a = preceding_snapshot(snapshots.get(token_a), decision.observed_at_ms, max_age_ms);
-        let b = preceding_snapshot(snapshots.get(token_b), decision.observed_at_ms, max_age_ms);
-        match (a.is_some(), b.is_some()) {
-            (true, true) => summary.both_legs_covered = summary.both_legs_covered.saturating_add(1),
-            (true, false) | (false, true) => {
-                summary.one_leg_covered = summary.one_leg_covered.saturating_add(1)
-            }
-            (false, false) => summary.no_legs_covered = summary.no_legs_covered.saturating_add(1),
-        }
-        for snapshot in [a, b].into_iter().flatten() {
-            ages.push((decision.observed_at_ms - snapshot.sampled_at_ms) as f64);
-            if let Some(spread) = spread(snapshot) {
-                spreads.push(spread);
-            }
-        }
+    let mut accumulator = Accumulator::default();
+    for row in rows {
+        accumulator.observe(row, snapshots, max_age_ms);
     }
-    summary.median_snapshot_age_ms = median(&mut ages);
-    summary.median_spread = median(&mut spreads);
-    summary
+    accumulator.finish()
 }
 
 fn preceding_snapshot<'a>(
@@ -157,21 +158,11 @@ mod tests {
     use super::*;
     use moni_proto::store::v1::BookLevel;
 
-    fn decision(observed_at_ms: i64) -> Decision {
-        Decision {
+    fn decision(observed_at_ms: i64) -> CalibrationRow {
+        CalibrationRow {
             observed_at_ms,
-            market_id: "market".to_owned(),
-            condition_id: Some("condition".to_owned()),
             token_id_a: Some("a".to_owned()),
             token_id_b: Some("b".to_owned()),
-            direction: None,
-            quantity: None,
-            expected_profit: None,
-            gate_unlocked: false,
-            submitted: false,
-            reason: "fixture".to_owned(),
-            store_coverage_a: None,
-            store_coverage_b: None,
         }
     }
 

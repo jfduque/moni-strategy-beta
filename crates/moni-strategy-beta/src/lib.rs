@@ -1,6 +1,7 @@
 pub mod clients;
 pub mod clob;
 pub mod config;
+pub mod decision_store;
 pub mod gamma;
 pub mod gate;
 pub mod link;

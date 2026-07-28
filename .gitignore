@@ -1,3 +1,6 @@
 /target/
 .env
 *.log
+
+# Archived artifacts of the lost 0.1.6 build (binary; kept out of git)
+archive/

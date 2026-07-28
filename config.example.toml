@@ -61,6 +61,6 @@ minimum_cycles = 100
 minimum_coverage = "0.99"
 
 [state]
-decision_log_path = "/var/lib/moni-strategy-beta/decisions.jsonl"
+decision_db_path = "/var/lib/moni-strategy-beta/decisions.sqlite3"
 calibration_log_path = "/var/lib/moni-strategy-beta/calibration.jsonl"
 gate_state_path = "/var/lib/moni-strategy-beta/gates.json"

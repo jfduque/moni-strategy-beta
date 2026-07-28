@@ -113,7 +113,7 @@ impl RuntimeConfig {
         {
             bail!("calibration requires >=24h, >=100 cycles, and coverage in [0,1]");
         }
-        if self.state.decision_log_path.trim().is_empty()
+        if self.state.decision_db_path.trim().is_empty()
             || self.state.calibration_log_path.trim().is_empty()
             || self.state.gate_state_path.trim().is_empty()
         {
@@ -236,7 +236,7 @@ pub struct CalibrationConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
-    pub decision_log_path: String,
+    pub decision_db_path: String,
     pub calibration_log_path: String,
     pub gate_state_path: String,
 }
@@ -299,7 +299,7 @@ minimum_age_hours = 24
 minimum_cycles = 100
 minimum_coverage = "0.99"
 [state]
-decision_log_path = "/var/lib/moni-strategy-beta/decisions.jsonl"
+decision_db_path = "/var/lib/moni-strategy-beta/decisions.sqlite3"
 calibration_log_path = "/var/lib/moni-strategy-beta/calibration.jsonl"
 gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
 "#;

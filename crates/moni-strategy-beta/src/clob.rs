@@ -558,7 +558,10 @@ mod tests {
             let base = Duration::from_millis(250)
                 .saturating_mul(1_u32 << attempt.min(5))
                 .min(RECONNECT_DELAY_MAX);
-            assert!(delay >= base / 2, "attempt {attempt}: {delay:?} < half base");
+            assert!(
+                delay >= base / 2,
+                "attempt {attempt}: {delay:?} < half base"
+            );
             assert!(delay <= base, "attempt {attempt}: {delay:?} over base");
         }
         assert!(reconnect_delay(20) <= RECONNECT_DELAY_MAX);
