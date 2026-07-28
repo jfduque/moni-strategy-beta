@@ -4,11 +4,34 @@ package moni.link.v1;
 
 service EngineLink {
   rpc GetEngineInfo(GetEngineInfoRequest) returns (EngineInfo);
+  rpc SubmitSignal(SubmitSignalRequest) returns (SubmitSignalResponse);
   rpc SubmitCompleteSetSignal(SubmitCompleteSetSignalRequest) returns (SubmitCompleteSetSignalResponse);
+  rpc SubmitObservation(SubmitObservationRequest) returns (SubmitObservationResponse);
 }
 
 message GetEngineInfoRequest {}
-message EngineInfo { string engine_id = 1; string build = 2; }
+
+message EngineInfo {
+  string engine_id = 1;
+  string build = 2;
+}
+
+message SubmitSignalRequest {
+  reserved 1;
+  reserved "tenant_id";
+  string strategy_id = 2;
+  string market_id = 3;
+  string side = 4;
+  string size = 5;
+  string confidence = 6;
+  string source = 7;
+  int64 observed_at_ms = 8;
+}
+
+message SubmitSignalResponse {
+  bool accepted = 1;
+  string reason = 2;
+}
 
 enum CompleteSetDirection {
   COMPLETE_SET_DIRECTION_UNSPECIFIED = 0;
@@ -39,4 +62,16 @@ message SubmitCompleteSetSignalResponse {
   bool accepted = 1;
   string reason = 2;
   bool duplicate = 3;
+}
+
+message SubmitObservationRequest {
+  string tenant_id = 1;
+  string strategy_id = 2;
+  string market_id = 3;
+  string payload_json = 4;
+  int64 observed_at_ms = 5;
+}
+
+message SubmitObservationResponse {
+  bool accepted = 1;
 }

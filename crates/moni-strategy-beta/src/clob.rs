@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -201,6 +201,106 @@ pub struct MarketFeed {
     books: Arc<RwLock<HashMap<String, Book>>>,
 }
 
+pub fn spawn_sharded_market_feed(
+    endpoint: String,
+    books: Arc<RwLock<HashMap<String, Book>>>,
+    max_assets_per_connection: usize,
+    max_total_assets: usize,
+) -> watch::Sender<Vec<String>> {
+    let shard_count = max_total_assets.div_ceil(max_assets_per_connection);
+    let (target_sender, mut target_receiver) = watch::channel(Vec::<String>::new());
+    let mut shard_senders = Vec::with_capacity(shard_count);
+    for _ in 0..shard_count {
+        let (sender, receiver) = watch::channel(BTreeSet::new());
+        shard_senders.push(sender);
+        tokio::spawn(MarketFeed::new(endpoint.clone(), receiver, books.clone()).run());
+    }
+    tokio::spawn(async move {
+        let mut assignments =
+            ShardAssignments::new(shard_count, max_assets_per_connection, max_total_assets);
+        loop {
+            if target_receiver.changed().await.is_err() {
+                return;
+            }
+            let targets = target_receiver.borrow_and_update().clone();
+            let shards = match assignments.assign(&targets) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(%error, "CLOB target set rejected");
+                    continue;
+                }
+            };
+            for (sender, target) in shard_senders.iter().zip(shards) {
+                let _ = sender.send(target);
+            }
+        }
+    });
+    target_sender
+}
+
+#[derive(Debug)]
+struct ShardAssignments {
+    shard_count: usize,
+    max_per_shard: usize,
+    max_total: usize,
+    assigned_shard: BTreeMap<String, usize>,
+}
+
+impl ShardAssignments {
+    fn new(shard_count: usize, max_per_shard: usize, max_total: usize) -> Self {
+        Self {
+            shard_count,
+            max_per_shard,
+            max_total,
+            assigned_shard: BTreeMap::new(),
+        }
+    }
+
+    fn assign(&mut self, asset_ids: &[String]) -> Result<Vec<BTreeSet<String>>> {
+        if asset_ids.len() > self.max_total {
+            bail!(
+                "{} assets exceed configured maximum {}",
+                asset_ids.len(),
+                self.max_total
+            );
+        }
+        let target = asset_ids.iter().cloned().collect::<BTreeSet<_>>();
+        self.assigned_shard
+            .retain(|asset_id, _| target.contains(asset_id));
+        let mut shards = vec![BTreeSet::new(); self.shard_count];
+        for (asset_id, shard) in &self.assigned_shard {
+            shards[*shard].insert(asset_id.clone());
+        }
+        for pair in asset_ids.chunks(2) {
+            if pair
+                .iter()
+                .all(|asset_id| self.assigned_shard.contains_key(asset_id))
+            {
+                continue;
+            }
+            let preferred = pair
+                .iter()
+                .find_map(|asset_id| self.assigned_shard.get(asset_id).copied());
+            let shard = preferred
+                .filter(|shard| shards[*shard].len() + pair.len() <= self.max_per_shard)
+                .or_else(|| {
+                    shards
+                        .iter()
+                        .position(|assets| assets.len() + pair.len() <= self.max_per_shard)
+                })
+                .context("no CLOB shard has capacity for an outcome pair")?;
+            for asset_id in pair {
+                if self.assigned_shard.contains_key(asset_id) {
+                    continue;
+                }
+                self.assigned_shard.insert(asset_id.clone(), shard);
+                shards[shard].insert(asset_id.clone());
+            }
+        }
+        Ok(shards)
+    }
+}
+
 impl MarketFeed {
     pub fn new(
         endpoint: String,
@@ -227,6 +327,12 @@ impl MarketFeed {
     }
 
     async fn run_once(&mut self) -> Result<()> {
+        while self.targets.borrow().is_empty() {
+            self.targets
+                .changed()
+                .await
+                .context("CLOB target set channel closed")?;
+        }
         let (stream, _) = connect_async(&self.endpoint)
             .await
             .context("connecting CLOB market feed")?;
@@ -238,8 +344,13 @@ impl MarketFeed {
                 .await
                 .context("sending initial subscription")?;
         }
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    sink.send(Message::Text("PING".into())).await.context("sending CLOB heartbeat")?;
+                }
                 changed = self.targets.changed() => {
                     changed.context("CLOB target set channel closed")?;
                     let target = self.targets.borrow().clone();
@@ -424,6 +535,30 @@ mod tests {
                 .to_string()
                 .contains("\"operation\":\"unsubscribe\"")
         );
+    }
+
+    #[test]
+    fn shard_assignments_keep_outcome_pairs_together() {
+        let mut assignments = ShardAssignments::new(2, 4, 8);
+        let shards = assignments
+            .assign(&[
+                "a-yes".to_owned(),
+                "a-no".to_owned(),
+                "b-yes".to_owned(),
+                "b-no".to_owned(),
+                "c-yes".to_owned(),
+                "c-no".to_owned(),
+            ])
+            .unwrap();
+        let shard_for = |token: &str| {
+            shards
+                .iter()
+                .position(|assets| assets.contains(token))
+                .unwrap()
+        };
+        assert_eq!(shard_for("a-yes"), shard_for("a-no"));
+        assert_eq!(shard_for("b-yes"), shard_for("b-no"));
+        assert_eq!(shard_for("c-yes"), shard_for("c-no"));
     }
 
     #[test]

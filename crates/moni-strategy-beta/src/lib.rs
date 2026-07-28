@@ -6,6 +6,7 @@ pub mod gate;
 pub mod link;
 pub mod pricing;
 pub mod service;
+pub mod store_calibration;
 
 use anyhow::{Context, Result, bail};
 use config::{DEFAULT_CONFIG_PATH, RuntimeConfig};
@@ -126,6 +127,28 @@ where
             );
             Ok(())
         }
+        "store-calibration-summary" => {
+            let config = RuntimeConfig::load(&config_path)?;
+            let summary = store_calibration::summarize_config(&config).await?;
+            println!(
+                "decisions={} eligible={} legacy={} both_legs={} one_leg={} no_legs={} median_snapshot_age_ms={} median_spread={}",
+                summary.decisions,
+                summary.eligible_decisions,
+                summary.legacy_decisions,
+                summary.both_legs_covered,
+                summary.one_leg_covered,
+                summary.no_legs_covered,
+                summary
+                    .median_snapshot_age_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                summary
+                    .median_spread
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+            );
+            Ok(())
+        }
         "manual-signal" => {
             let config = RuntimeConfig::load(&config_path)?;
             let market = args.get(2).context("manual-signal requires MARKET_ID")?;
@@ -141,7 +164,7 @@ where
         }
         _ => {
             println!(
-                "usage: moni-strategy-beta <serve|--discover-only|calibration-summary|execution-summary|manual-signal MARKET_ID> [--config PATH] [--dry-run] [--confirm MANUAL_DIAGNOSTIC_ONLY]"
+                "usage: moni-strategy-beta <serve|--discover-only|calibration-summary|store-calibration-summary|execution-summary|manual-signal MARKET_ID> [--config PATH] [--dry-run] [--confirm MANUAL_DIAGNOSTIC_ONLY]"
             );
             Ok(())
         }

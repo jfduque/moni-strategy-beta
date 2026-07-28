@@ -69,6 +69,13 @@ impl RuntimeConfig {
         {
             bail!("all CLOB endpoints are required");
         }
+        if self.clob.max_assets_per_connection == 0
+            || self.clob.max_total_assets < self.clob.max_assets_per_connection
+        {
+            bail!(
+                "clob shard limits must be positive and max_total_assets must be at least max_assets_per_connection"
+            );
+        }
         if self.quality.max_book_age_ms == 0
             || self.quality.max_token_skew_ms == 0
             || self.quality.rest_timeout_ms == 0
@@ -164,6 +171,18 @@ pub struct ClobConfig {
     pub ws_endpoint: String,
     pub rest_endpoint: String,
     pub market_info_endpoint: String,
+    #[serde(default = "default_max_assets_per_connection")]
+    pub max_assets_per_connection: usize,
+    #[serde(default = "default_max_total_assets")]
+    pub max_total_assets: usize,
+}
+
+const fn default_max_assets_per_connection() -> usize {
+    200
+}
+
+const fn default_max_total_assets() -> usize {
+    10_000
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -249,6 +268,8 @@ refresh_interval_secs = 30
 ws_endpoint = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 rest_endpoint = "https://clob.polymarket.com/books"
 market_info_endpoint = "https://clob.polymarket.com"
+max_assets_per_connection = 500
+max_total_assets = 10000
 [quality]
 max_book_age_ms = 750
 max_token_skew_ms = 250
@@ -288,6 +309,17 @@ gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
         let config = RuntimeConfig::from_toml_str(VALID).unwrap();
         assert_eq!(config.discovery.max_pages, 30);
         assert_eq!(config.risk.max_per_cycle, Decimal::from(5));
+    }
+
+    #[test]
+    fn clob_shard_limits_default_for_existing_configs() {
+        let raw = VALID
+            .replace("max_assets_per_connection = 500\n", "")
+            .replace("max_total_assets = 10000\n", "");
+        let config = RuntimeConfig::from_toml_str(&raw).unwrap();
+
+        assert_eq!(config.clob.max_assets_per_connection, 200);
+        assert_eq!(config.clob.max_total_assets, 10_000);
     }
 
     #[test]

@@ -1,9 +1,155 @@
 syntax = "proto3";
+
 package moni.v1;
+
 import "moni/v1/common.proto";
 
 service Monitor {
+  rpc GetStatus(GetStatusRequest) returns (TenantStatus);
+  rpc GetMarketDataStatus(GetMarketDataStatusRequest) returns (GetMarketDataStatusResponse);
+  rpc ListPositions(ListPositionsRequest) returns (ListPositionsResponse);
+  rpc ListRiskEvents(ListRiskEventsRequest) returns (ListRiskEventsResponse);
+  rpc ListDryRuns(ListDryRunsRequest) returns (ListDryRunsResponse);
+  rpc GetPnlOverview(GetPnlOverviewRequest) returns (PnlOverview);
   rpc ListCompleteSetExecutions(ListCompleteSetExecutionsRequest) returns (ListCompleteSetExecutionsResponse);
+}
+
+message GetStatusRequest {}
+
+message GetMarketDataStatusRequest {}
+
+message GetMarketDataStatusResponse {
+  repeated MarketDataFeedStatus feeds = 1;
+}
+
+message TenantStatus {
+  string tenant_id = 1;
+  string label = 2;
+  string status = 3;
+  bool dry_run = 4;
+  uint64 open_positions = 5;
+  uint64 risk_event_count = 6;
+  uint64 dry_run_record_count = 7;
+  MarketDataFeedStatus user_feed = 8;
+}
+
+message MarketDataFeedStatus {
+  string source = 1;
+  string tenant_id = 2;
+  bool connected = 3;
+  bool authenticated = 4;
+  uint64 subscribed_count = 5;
+  int64 last_message_at_ms = 6;
+  int64 last_heartbeat_at_ms = 7;
+  uint64 reconnect_count = 8;
+  uint64 parse_error_count = 9;
+  uint64 dropped_message_count = 10;
+  uint64 max_lag_ms = 11;
+  string unhealthy_reason = 12;
+}
+
+message ListPositionsRequest {
+  TenantRef tenant = 1;
+  uint32 limit = 2;
+  PositionStateFilter state_filter = 3;
+}
+
+enum PositionStateFilter {
+  POSITION_STATE_FILTER_UNSPECIFIED = 0;
+  POSITION_STATE_FILTER_ALL = 1;
+  POSITION_STATE_FILTER_OPEN = 2;
+  POSITION_STATE_FILTER_NON_OPEN = 3;
+}
+
+message Position {
+  string position_id = 1;
+  string tenant_id = 2;
+  string market_id = 3;
+  string condition_id = 4;
+  string token_id = 5;
+  string size = 6;
+  string average_price = 7;
+  string notional_at_risk = 8;
+  string realized_pnl = 9;
+  string state = 10;
+  int64 updated_at_ms = 11;
+  string market_name = 12;   // human-readable market question; falls back to market_id
+  string outcome_label = 13; // e.g. "YES" / "NO"; empty if unknown
+  string current_price = 14; // top order-book bid; empty if no order book available
+  string unrealized_pnl = 15; // size * current_price - notional_at_risk; empty if no mark
+  string strategy_id = 16; // empty when unknown (pre-existing positions)
+}
+
+message ListPositionsResponse {
+  repeated Position positions = 1;
+}
+
+message ListRiskEventsRequest {
+  TenantRef tenant = 1;
+}
+
+message RiskEvent {
+  string risk_event_id = 1;
+  string tenant_id = 2;
+  string opportunity_id = 3;
+  string market_id = 4;
+  string decision = 5;
+  string reason = 6;
+  string amount = 7;
+  int64 occurred_at_ms = 8;
+}
+
+message ListRiskEventsResponse {
+  repeated RiskEvent events = 1;
+}
+
+message ListDryRunsRequest {
+  TenantRef tenant = 1;
+}
+
+message DryRunRecord {
+  string dry_run_id = 1;
+  string tenant_id = 2;
+  string opportunity_id = 3;
+  string market_id = 4;
+  string strategy_id = 5;
+  string status = 6;
+  int64 queued_at_ms = 7;
+  int64 due_at_ms = 8;
+  string market_name = 9;   // human-readable market question; falls back to market_id
+  string expected_edge = 10;    // decimal as string; empty when unavailable
+  string expected_profit = 11;  // decimal as string; empty when unavailable
+  int64 rechecked_at_ms = 12;  // 0 when never rechecked
+  string rechecked_edge = 13;   // decimal as string; empty when not rechecked
+  string rechecked_profit = 14; // decimal as string; empty when not rechecked
+  string failure_reason = 15;   // human-readable; empty on success
+}
+
+message ListDryRunsResponse {
+  repeated DryRunRecord records = 1;
+}
+
+message GetPnlOverviewRequest {
+  TenantRef tenant = 1;
+}
+
+message PnlOverview {
+  string cash_balance = 1;
+  bool cash_balance_available = 2;
+  string daily_pnl = 3;
+  string lifetime_pnl = 4;
+  repeated PnlPoint points = 5;
+  repeated StrategyDailyPnl strategy_daily_pnls = 6;
+}
+
+message PnlPoint {
+  int64 day_start_ms = 1;
+  string cumulative_pnl = 2;
+}
+
+message StrategyDailyPnl {
+  string strategy_id = 1;
+  string daily_pnl = 2;
 }
 
 message ListCompleteSetExecutionsRequest {
@@ -13,23 +159,43 @@ message ListCompleteSetExecutionsRequest {
   bool terminal_only = 4;
   uint32 limit = 5;
 }
+
 message CompleteSetLegOutcome {
-  string token_id = 1; string side = 2; string state = 3;
-  string requested_quantity = 4; string filled_quantity = 5;
-  string average_price = 6; string fee = 7; string order_id = 8;
-  string failure_reason = 9; int64 updated_at_ms = 10;
+  string token_id = 1;
+  string side = 2;
+  string state = 3;
+  string requested_quantity = 4;
+  string filled_quantity = 5;
+  string average_price = 6;
+  string fee = 7;
+  string order_id = 8;
+  string failure_reason = 9;
+  int64 updated_at_ms = 10;
 }
+
 message CompleteSetExecution {
-  string tenant_id = 1; string strategy_id = 2; string signal_id = 3;
-  string source = 4; string market_id = 5; string condition_id = 6;
-  string direction = 7; string quantity = 8; string state = 9;
-  CompleteSetLegOutcome leg_a = 10; CompleteSetLegOutcome leg_b = 11;
-  string conversion_state = 12; string conversion_tx_id = 13;
-  string recovery_action = 14; string realized_profit = 15;
-  int64 observed_at_ms = 16; int64 created_at_ms = 17;
-  int64 updated_at_ms = 18; int64 completed_at_ms = 19;
+  string tenant_id = 1;
+  string strategy_id = 2;
+  string signal_id = 3;
+  string source = 4;
+  string market_id = 5;
+  string condition_id = 6;
+  string direction = 7;
+  string quantity = 8;
+  string state = 9;
+  CompleteSetLegOutcome leg_a = 10;
+  CompleteSetLegOutcome leg_b = 11;
+  string conversion_state = 12;
+  string conversion_tx_id = 13;
+  string recovery_action = 14;
+  string realized_profit = 15;
+  int64 observed_at_ms = 16;
+  int64 created_at_ms = 17;
+  int64 updated_at_ms = 18;
+  int64 completed_at_ms = 19;
   string failure_reason = 20;
 }
+
 message ListCompleteSetExecutionsResponse {
   repeated CompleteSetExecution executions = 1;
 }

@@ -68,26 +68,30 @@ impl Store {
         })
     }
 
-    pub async fn has_recent_snapshot(
+    pub async fn snapshots(
         &mut self,
-        token_id: &str,
-        now_ms: i64,
-        max_age_ms: u64,
-    ) -> Result<bool> {
+        token_ids: Vec<String>,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<store_pb::BookSnapshot>> {
         let mut stream = self
             .client
-            .stream_book_snapshot_range(store_pb::StreamBookSnapshotRangeRequest {
-                token_id: token_id.to_owned(),
-                from_ms: now_ms.saturating_sub(max_age_ms as i64),
-                to_ms: now_ms,
+            .stream_book_snapshots_range(store_pb::StreamBookSnapshotsRangeRequest {
+                token_ids,
+                from_ms,
+                to_ms,
             })
             .await
-            .context("querying moni-store book coverage")?
+            .context("querying moni-store book snapshots")?
             .into_inner();
-        Ok(stream
+        let mut snapshots = Vec::new();
+        while let Some(snapshot) = stream
             .message()
             .await
-            .context("reading moni-store book coverage")?
-            .is_some())
+            .context("reading moni-store book snapshots")?
+        {
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
     }
 }

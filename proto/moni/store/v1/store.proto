@@ -1,14 +1,70 @@
 syntax = "proto3";
+
 package moni.store.v1;
 
 service Store {
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc StreamRange(StreamRangeRequest) returns (stream Bar);
+  rpc AppendBookSnapshots(AppendBookSnapshotsRequest) returns (AppendBookSnapshotsResponse);
+  rpc AppendBookSnapshotBatch(stream AppendBookSnapshotsRequest) returns (AppendBookSnapshotsResponse);
   rpc StreamBookSnapshotRange(StreamBookSnapshotRangeRequest) returns (stream BookSnapshot);
+  rpc StreamBookSnapshotsRange(StreamBookSnapshotsRangeRequest) returns (stream BookSnapshot);
 }
-message BookLevel { string price = 1; string size = 2; }
+
+message AppendRequest {
+  string symbol = 1;
+  repeated Bar bars = 2;
+}
+
+message AppendResponse {
+  uint32 accepted = 1;
+}
+
+message StreamRangeRequest {
+  string symbol = 1;
+  int64 from_ms = 2;
+  int64 to_ms = 3;
+}
+
+message Bar {
+  int64 ts_ms = 1;
+  string open = 2;
+  string high = 3;
+  string low = 4;
+  string close = 5;
+  optional string volume = 6; // absent when the source has no trade volume
+}
+
+message BookLevel {
+  string price = 1;
+  string size = 2;
+}
+
 message BookSnapshot {
-  int64 sampled_at_ms = 1; string market_id = 2; string token_id = 3;
-  int64 book_updated_at_ms = 4; repeated BookLevel bids = 5; repeated BookLevel asks = 6;
+  int64 sampled_at_ms = 1;      // shared sample tick across every snapshot in one flush
+  string market_id = 2;
+  string token_id = 3;
+  int64 book_updated_at_ms = 4; // OrderBook.updated_at at sample time (staleness signal)
+  repeated BookLevel bids = 5;
+  repeated BookLevel asks = 6;
 }
+
+message AppendBookSnapshotsRequest {
+  repeated BookSnapshot snapshots = 1; // spans multiple tokens in one flush; no top-level token_id
+}
+
+message AppendBookSnapshotsResponse {
+  uint32 accepted = 1;
+}
+
 message StreamBookSnapshotRangeRequest {
-  string token_id = 1; int64 from_ms = 2; int64 to_ms = 3;
+  string token_id = 1;
+  int64 from_ms = 2;
+  int64 to_ms = 3;
+}
+
+message StreamBookSnapshotsRangeRequest {
+  repeated string token_ids = 1;
+  int64 from_ms = 2;
+  int64 to_ms = 3;
 }

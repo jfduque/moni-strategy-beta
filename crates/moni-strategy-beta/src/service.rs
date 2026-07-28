@@ -1,5 +1,5 @@
-use crate::clients::{Monitor, Store};
-use crate::clob::{MarketFeed, RestClient};
+use crate::clients::Monitor;
+use crate::clob::{RestClient, spawn_sharded_market_feed};
 use crate::config::RuntimeConfig;
 use crate::gamma::{BinaryCryptoMarket, GammaClient};
 use crate::gate::{
@@ -11,24 +11,32 @@ use crate::pricing::{
 };
 use anyhow::{Context, Result, bail};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 
-#[derive(Clone, Debug, Serialize)]
-struct Decision {
-    observed_at_ms: i64,
-    market_id: String,
-    direction: Option<Direction>,
-    quantity: Option<Decimal>,
-    expected_profit: Option<Decimal>,
-    gate_unlocked: bool,
-    submitted: bool,
-    reason: String,
-    store_coverage_a: Option<bool>,
-    store_coverage_b: Option<bool>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct Decision {
+    pub(crate) observed_at_ms: i64,
+    pub(crate) market_id: String,
+    #[serde(default)]
+    pub(crate) condition_id: Option<String>,
+    #[serde(default)]
+    pub(crate) token_id_a: Option<String>,
+    #[serde(default)]
+    pub(crate) token_id_b: Option<String>,
+    pub(crate) direction: Option<Direction>,
+    pub(crate) quantity: Option<Decimal>,
+    pub(crate) expected_profit: Option<Decimal>,
+    pub(crate) gate_unlocked: bool,
+    pub(crate) submitted: bool,
+    pub(crate) reason: String,
+    #[serde(default)]
+    pub(crate) store_coverage_a: Option<bool>,
+    #[serde(default)]
+    pub(crate) store_coverage_b: Option<bool>,
 }
 
 #[derive(Default)]
@@ -72,8 +80,7 @@ pub struct StrategyService {
     rest: RestClient,
     submitter: Submitter,
     monitor: Monitor,
-    store: Option<Store>,
-    target_sender: watch::Sender<BTreeSet<String>>,
+    target_sender: watch::Sender<Vec<String>>,
     books: Arc<RwLock<HashMap<String, Book>>>,
     gates: GateState,
     circuits: CircuitState,
@@ -97,22 +104,12 @@ impl StrategyService {
             config.monitor.tenant_id.clone(),
         )
         .await?;
-        let store = match Store::connect(config.store.endpoint.clone()).await {
-            Ok(store) => Some(store),
-            Err(error) => {
-                tracing::warn!(%error, "moni-store unavailable; coverage will be reported missing");
-                None
-            }
-        };
         let books = Arc::new(RwLock::new(HashMap::new()));
-        let (target_sender, target_receiver) = watch::channel(BTreeSet::new());
-        tokio::spawn(
-            MarketFeed::new(
-                config.clob.ws_endpoint.clone(),
-                target_receiver,
-                books.clone(),
-            )
-            .run(),
+        let target_sender = spawn_sharded_market_feed(
+            config.clob.ws_endpoint.clone(),
+            books.clone(),
+            config.clob.max_assets_per_connection,
+            config.clob.max_total_assets,
         );
         Ok(Self {
             gamma: GammaClient::new(
@@ -130,7 +127,6 @@ impl StrategyService {
             observe_only,
             submitter,
             monitor,
-            store,
             target_sender,
             books,
             circuits: CircuitState::default(),
@@ -356,15 +352,14 @@ impl StrategyService {
                 self.config.calibration.minimum_coverage,
             )
             .clone();
-        let (coverage_a, coverage_b) = self.store_coverage(market, now_ms).await;
         if !gate.unlocked {
             self.log_decision(
                 market,
                 Some(&final_opportunity),
                 false,
                 "calibration_gate_locked",
-                coverage_a,
-                coverage_b,
+                None,
+                None,
             )?;
             return Ok(());
         }
@@ -374,8 +369,8 @@ impl StrategyService {
                 Some(&final_opportunity),
                 false,
                 "forced_observe_only",
-                coverage_a,
-                coverage_b,
+                None,
+                None,
             )?;
             return Ok(());
         }
@@ -421,19 +416,12 @@ impl StrategyService {
                     Some(&final_opportunity),
                     true,
                     "submitted",
-                    coverage_a,
-                    coverage_b,
+                    None,
+                    None,
                 )?;
             }
             SubmitOutcome::Rejected(reason) | SubmitOutcome::Retriable(reason) => {
-                self.log_decision(
-                    market,
-                    Some(&final_opportunity),
-                    false,
-                    &reason,
-                    coverage_a,
-                    coverage_b,
-                )?;
+                self.log_decision(market, Some(&final_opportunity), false, &reason, None, None)?;
             }
         }
         Ok(())
@@ -510,33 +498,6 @@ impl StrategyService {
         Ok(())
     }
 
-    async fn store_coverage(
-        &mut self,
-        market: &BinaryCryptoMarket,
-        now_ms: i64,
-    ) -> (Option<bool>, Option<bool>) {
-        let Some(store) = self.store.as_mut() else {
-            return (Some(false), Some(false));
-        };
-        let a = store
-            .has_recent_snapshot(
-                &market.outcomes[0].token_id,
-                now_ms,
-                self.config.store.snapshot_max_age_ms,
-            )
-            .await
-            .ok();
-        let b = store
-            .has_recent_snapshot(
-                &market.outcomes[1].token_id,
-                now_ms,
-                self.config.store.snapshot_max_age_ms,
-            )
-            .await
-            .ok();
-        (a, b)
-    }
-
     fn log_decision(
         &self,
         market: &BinaryCryptoMarket,
@@ -551,6 +512,15 @@ impl StrategyService {
             &Decision {
                 observed_at_ms: now_millis(),
                 market_id: market.market_id.clone(),
+                condition_id: Some(market.condition_id.clone()),
+                token_id_a: market
+                    .outcomes
+                    .first()
+                    .map(|outcome| outcome.token_id.clone()),
+                token_id_b: market
+                    .outcomes
+                    .get(1)
+                    .map(|outcome| outcome.token_id.clone()),
                 direction: opportunity.map(|value| value.direction),
                 quantity: opportunity.map(|value| value.quantity),
                 expected_profit: opportunity.map(|value| value.net_profit),
