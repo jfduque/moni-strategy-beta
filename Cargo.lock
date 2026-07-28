@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "moni-proto"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "prost",
  "tonic",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "moni-strategy-beta"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "futures-util",
