@@ -8,7 +8,8 @@ use crate::gate::{
 };
 use crate::link::{SubmitOutcome, Submitter, request};
 use crate::pricing::{
-    Book, Direction, Opportunity, best_for_direction, validate_fee_metadata, validate_final_books,
+    Book, Direction, Opportunity, Rejection, best_for_direction, validate_fee_metadata,
+    validate_final_books,
 };
 use anyhow::{Context, Result, bail};
 use rust_decimal::Decimal;
@@ -254,6 +255,7 @@ impl StrategyService {
         };
         let bucket = DurationBucket::from_remaining_ms(market.end_time_ms.saturating_sub(now_ms))
             .context("market duration is outside calibration buckets")?;
+        let mut outside_price_band = true;
         let preliminary = [Direction::BuyMerge, Direction::SplitSell]
             .into_iter()
             .filter_map(|direction| {
@@ -261,7 +263,7 @@ impl StrategyService {
                     &self.config.reserves,
                     self.gates.status(GateKey { direction, bucket }),
                 );
-                best_for_direction(
+                match best_for_direction(
                     &ws_a,
                     &ws_b,
                     &fees,
@@ -269,12 +271,27 @@ impl StrategyService {
                     &self.config.profitability,
                     &reserves,
                     &self.config.risk,
-                )
+                ) {
+                    Ok(opportunity) => {
+                        outside_price_band = false;
+                        Some(opportunity)
+                    }
+                    Err(Rejection::OutsidePriceBand) => None,
+                    Err(Rejection::NoProfitableDepth) => {
+                        outside_price_band = false;
+                        None
+                    }
+                }
             })
             .max_by(|left, right| left.net_profit.cmp(&right.net_profit));
         let Some(preliminary) = preliminary else {
             self.episodes.close_market(&market.market_id);
-            self.log_decision(market, None, false, "no_profitable_depth", None, None)?;
+            let reason = if outside_price_band {
+                "outside_price_band"
+            } else {
+                "no_profitable_depth"
+            };
+            self.log_decision(market, None, false, reason, None, None)?;
             return Ok(());
         };
 
@@ -320,6 +337,7 @@ impl StrategyService {
             &final_reserves,
             &self.config.risk,
         )
+        .ok()
         .context("opportunity disappeared in final REST refresh")?;
 
         self.episodes

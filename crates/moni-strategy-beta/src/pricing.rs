@@ -44,6 +44,12 @@ pub struct FeeSchedule {
     pub rate: Decimal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    OutsidePriceBand,
+    NoProfitableDepth,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opportunity {
     pub direction: Direction,
@@ -151,6 +157,7 @@ pub fn select_best(
                 reserves,
                 risk,
             )
+            .ok()
         })
         .max_by(compare_opportunities)
 }
@@ -163,14 +170,14 @@ pub fn best_for_direction(
     profitability: &ProfitabilityConfig,
     reserves: &ReserveConfig,
     risk: &RiskConfig,
-) -> Option<Opportunity> {
+) -> Result<Opportunity, Rejection> {
     let side = match direction {
         Direction::BuyMerge => Side::Ask,
         Direction::SplitSell => Side::Bid,
     };
     let levels_a = levels(book_a, side);
     let levels_b = levels(book_b, side);
-    let top_price = levels_a.first()?.price;
+    let top_price = levels_a.first().ok_or(Rejection::NoProfitableDepth)?.price;
     if top_price > profitability.price_band_low_max && top_price < profitability.price_band_high_min
     {
         // Polymarket's taker fee is rate * price * (1 - price), which peaks at the
@@ -178,12 +185,12 @@ pub fn best_for_direction(
         // 50c for a 7% category) exceed any realistic complete-set mispricing, so
         // no minimum_return_bps value could ever clear here — skip without paying
         // for the REST cross-check.
-        return None;
+        return Err(Rejection::OutsidePriceBand);
     }
     let common_depth = total_depth(levels_a).min(total_depth(levels_b));
     let participation_cap = common_depth * profitability.depth_fraction;
     if participation_cap <= Decimal::ZERO {
-        return None;
+        return Err(Rejection::NoProfitableDepth);
     }
     let mut breakpoints = cumulative_breakpoints(levels_a);
     breakpoints.extend(cumulative_breakpoints(levels_b));
@@ -200,6 +207,7 @@ pub fn best_for_direction(
                 && opportunity.return_bps >= profitability.minimum_return_bps
         })
         .max_by(compare_opportunities)
+        .ok_or(Rejection::NoProfitableDepth)
 }
 
 pub fn evaluate(
@@ -408,7 +416,7 @@ mod tests {
         };
         let in_band_a = book("a", &[], &[("0.48", "10")], 100);
         let in_band_b = book("b", &[], &[("0.48", "10")], 100);
-        assert!(
+        assert_eq!(
             best_for_direction(
                 &in_band_a,
                 &in_band_b,
@@ -417,8 +425,8 @@ mod tests {
                 &profitability(),
                 &reserves(),
                 &risk(),
-            )
-            .is_none()
+            ),
+            Err(Rejection::OutsidePriceBand)
         );
 
         let extreme_a = book("a", &[], &[("0.05", "10")], 100);
@@ -433,7 +441,7 @@ mod tests {
                 &reserves(),
                 &risk(),
             )
-            .is_some()
+            .is_ok()
         );
     }
 
