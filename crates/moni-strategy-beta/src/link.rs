@@ -17,6 +17,7 @@ pub enum SubmitOutcome {
 #[derive(Clone)]
 pub struct Submitter {
     client: EngineLinkClient<Channel>,
+    automatic_submission_supported: bool,
 }
 
 impl Submitter {
@@ -26,8 +27,16 @@ impl Submitter {
             .connect()
             .await
             .context("connecting EngineLink")?;
+        let mut client = EngineLinkClient::new(channel);
+        let capabilities = client
+            .get_engine_info(pb::GetEngineInfoRequest {})
+            .await
+            .map(|response| response.into_inner().capabilities)
+            .unwrap_or_default();
+        let automatic_submission_supported = supports_automatic_submission(&capabilities);
         Ok(Self {
-            client: EngineLinkClient::new(channel),
+            client,
+            automatic_submission_supported,
         })
     }
 
@@ -35,6 +44,11 @@ impl Submitter {
         &mut self,
         request: pb::SubmitCompleteSetSignalRequest,
     ) -> Result<SubmitOutcome> {
+        if !self.automatic_submission_supported {
+            return Ok(SubmitOutcome::Rejected(
+                "engine lacks close-recovery/reconciliation capabilities".to_owned(),
+            ));
+        }
         match self.client.submit_complete_set_signal(request).await {
             Ok(response) => {
                 let response = response.into_inner();
@@ -58,6 +72,12 @@ impl Submitter {
     }
 }
 
+fn supports_automatic_submission(capabilities: &[String]) -> bool {
+    ["close_recovery_v1", "complete_set_reconciliation_v1"]
+        .iter()
+        .all(|required| capabilities.iter().any(|value| value == required))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn request(
     signal_id: String,
@@ -68,6 +88,9 @@ pub fn request(
     token_a_book_observed_at_ms: i64,
     token_b_book_observed_at_ms: i64,
     observed_at_ms: i64,
+    recovery_enabled: bool,
+    close_lead_ms: i64,
+    max_loss: rust_decimal::Decimal,
 ) -> pb::SubmitCompleteSetSignalRequest {
     let (direction, max_pair_cost, min_pair_proceeds) = match opportunity.direction {
         Direction::BuyMerge => (
@@ -98,6 +121,10 @@ pub fn request(
         token_a_book_observed_at_ms,
         token_b_book_observed_at_ms,
         observed_at_ms,
+        close_recovery: recovery_enabled.then(|| pb::CloseRecoveryPolicy {
+            lead_time_ms: close_lead_ms,
+            max_loss: max_loss.to_string(),
+        }),
     }
 }
 
@@ -106,6 +133,18 @@ mod tests {
     use super::*;
     use crate::gamma::OutcomeToken;
     use rust_decimal::Decimal;
+
+    #[test]
+    fn automatic_submission_requires_both_engine_capabilities() {
+        assert!(!supports_automatic_submission(&[]));
+        assert!(!supports_automatic_submission(&[
+            "close_recovery_v1".to_owned()
+        ]));
+        assert!(supports_automatic_submission(&[
+            "complete_set_reconciliation_v1".to_owned(),
+            "close_recovery_v1".to_owned(),
+        ]));
+    }
 
     #[test]
     fn request_is_tenant_agnostic_and_direction_specific() {
@@ -157,8 +196,12 @@ mod tests {
             1,
             1,
             1,
+            true,
+            30_000,
+            Decimal::new(50, 2),
         );
         assert_eq!(request.max_pair_cost, "0.8");
         assert!(request.min_pair_proceeds.is_empty());
+        assert_eq!(request.close_recovery.unwrap().lead_time_ms, 30_000);
     }
 }

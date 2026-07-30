@@ -11,6 +11,8 @@ workspace = true
 anyhow = "1"
 futures-util = "0.3"
 hex = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 moni-proto = { path = "../moni-proto" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -5,6 +5,7 @@ pub mod decision_store;
 pub mod gamma;
 pub mod gate;
 pub mod link;
+pub mod metrics;
 pub mod pricing;
 pub mod service;
 pub mod store_calibration;
@@ -36,6 +37,7 @@ where
         "serve" => {
             let config = RuntimeConfig::load(&config_path)?;
             let observe_only = args.iter().any(|argument| argument == "--dry-run");
+            metrics::install(&config.metrics)?;
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 observe_only,

@@ -12,12 +12,16 @@ pub struct RuntimeConfig {
     pub link: LinkConfig,
     pub monitor: MonitorConfig,
     pub store: StoreConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     pub discovery: DiscoveryConfig,
     pub clob: ClobConfig,
     pub quality: QualityConfig,
     pub profitability: ProfitabilityConfig,
     pub reserves: ReserveConfig,
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
     pub calibration: CalibrationConfig,
     pub state: StateConfig,
 }
@@ -51,6 +55,9 @@ impl RuntimeConfig {
             || self.monitor.api_key_env.trim().is_empty()
         {
             bail!("monitor.endpoint, tenant_id, and api_key_env are required");
+        }
+        if self.metrics.bind.parse::<std::net::SocketAddr>().is_err() {
+            bail!("metrics.bind must be a socket address");
         }
         if self.discovery.gamma_endpoint.trim().is_empty()
             || self.discovery.page_limit == 0
@@ -162,6 +169,20 @@ pub struct StoreConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub bind: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:9465".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     pub gamma_endpoint: String,
@@ -241,6 +262,22 @@ pub struct RiskConfig {
     pub max_unmatched_inventory: Decimal,
     pub daily_loss_limit: Decimal,
     pub signals_per_minute: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryConfig {
+    pub enabled: bool,
+    pub close_lead_ms: i64,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            close_lead_ms: 30_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -329,6 +366,35 @@ gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
         let config = RuntimeConfig::from_toml_str(VALID).unwrap();
         assert_eq!(config.discovery.max_pages, 30);
         assert_eq!(config.risk.max_per_cycle, Decimal::from(5));
+        assert_eq!(config.metrics.bind, "127.0.0.1:9465");
+        assert!(config.recovery.enabled);
+        assert_eq!(config.recovery.close_lead_ms, 30_000);
+    }
+
+    #[test]
+    fn metrics_bind_can_be_overridden() {
+        let raw = VALID.replace(
+            "[discovery]",
+            "[metrics]\nbind = \"10.0.3.17:9465\"\n[discovery]",
+        );
+        let config = RuntimeConfig::from_toml_str(&raw).unwrap();
+
+        assert_eq!(config.metrics.bind, "10.0.3.17:9465");
+    }
+
+    #[test]
+    fn metrics_bind_must_be_a_socket_address() {
+        let raw = VALID.replace(
+            "[discovery]",
+            "[metrics]\nbind = \"not-an-address\"\n[discovery]",
+        );
+
+        assert!(
+            RuntimeConfig::from_toml_str(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("metrics.bind must be a socket address")
+        );
     }
 
     #[test]

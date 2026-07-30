@@ -194,6 +194,13 @@ message CompleteSetExecution {
   int64 updated_at_ms = 18;
   int64 completed_at_ms = 19;
   string failure_reason = 20;
+  string conversion_reconciliation_state = 21;
+  string conversion_verified_quantity = 22;
+  string conversion_token_a_delta = 23;
+  string conversion_token_b_delta = 24;
+  string conversion_collateral_delta = 25;
+  string close_recovery_state = 26;
+  string close_recovery_residual_quantity = 27;
 }
 
 message ListCompleteSetExecutionsResponse {

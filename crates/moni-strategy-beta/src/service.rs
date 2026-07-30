@@ -92,6 +92,7 @@ pub struct StrategyService {
     circuits: CircuitState,
     episodes: EpisodeTracker,
     submitted: BTreeMap<String, (String, Direction, Decimal, String)>,
+    blocked_markets: BTreeSet<String>,
     daily_loss_halted: bool,
     market_info: HashMap<String, MarketInfo>,
     rejection_heartbeats: HashMap<String, (String, i64)>,
@@ -142,6 +143,7 @@ impl StrategyService {
             circuits: CircuitState::default(),
             episodes: EpisodeTracker::default(),
             submitted: BTreeMap::new(),
+            blocked_markets: BTreeSet::new(),
             daily_loss_halted: false,
             market_info: HashMap::new(),
             rejection_heartbeats: HashMap::new(),
@@ -160,8 +162,13 @@ impl StrategyService {
                     return Ok(());
                 }
                 _ = interval.tick() => {
-                    if let Err(error) = self.iteration(None).await {
-                        tracing::warn!(%error, "strategy-beta evaluation cycle failed");
+                    let started = Instant::now();
+                    match self.iteration(None).await {
+                        Ok(()) => crate::metrics::record_cycle("success", started.elapsed()),
+                        Err(error) => {
+                            crate::metrics::record_cycle("failed", started.elapsed());
+                            tracing::warn!(%error, "strategy-beta evaluation cycle failed");
+                        }
                     }
                 }
             }
@@ -194,6 +201,10 @@ impl StrategyService {
         self.rejection_heartbeats
             .retain(|market_id, _| active_markets.contains(market_id.as_str()));
         let cache_entries_before = self.market_info.len();
+        let subscribable_markets = markets
+            .iter()
+            .filter(|market| market.subscribable(now_ms, self.config.discovery.max_horizon_ms))
+            .count();
         let targets = markets
             .iter()
             .filter(|market| market.subscribable(now_ms, self.config.discovery.max_horizon_ms))
@@ -237,6 +248,18 @@ impl StrategyService {
             }
         }
         self.gates.save(&self.config.state.gate_state_path)?;
+        let gates_unlocked = self
+            .gates
+            .summaries()
+            .iter()
+            .filter(|(_, status)| status.unlocked)
+            .count();
+        crate::metrics::set_cycle_gauges(
+            markets.len(),
+            subscribable_markets,
+            self.market_info.len(),
+            gates_unlocked,
+        );
         tracing::info!(
             discovered_markets = markets.len(),
             metadata_cache_entries = self.market_info.len(),
@@ -407,6 +430,7 @@ impl StrategyService {
         };
         if self.gates.record(key, sample.clone()) {
             append_jsonl(&self.config.state.calibration_log_path, &sample)?;
+            crate::metrics::record_candidate(final_opportunity.direction, bucket);
         }
         let gate = self
             .gates
@@ -440,6 +464,17 @@ impl StrategyService {
             )?;
             return Ok(());
         }
+        if self.blocked_markets.contains(&market.market_id) {
+            self.log_decision(
+                market,
+                Some(&final_opportunity),
+                false,
+                "market_close_recovery_blocked",
+                None,
+                None,
+            )?;
+            return Ok(());
+        }
         self.check_risk(market, &final_opportunity)?;
         self.circuits.can_start(
             &market.market_id,
@@ -459,8 +494,17 @@ impl StrategyService {
                 rest_a.updated_at_ms,
                 rest_b.updated_at_ms,
                 now_ms,
+                self.config.recovery.enabled,
+                self.config.recovery.close_lead_ms,
+                self.config.risk.max_orphan_loss,
             ))
             .await?;
+        crate::metrics::record_submission(match &outcome {
+            SubmitOutcome::Accepted => "accepted",
+            SubmitOutcome::Duplicate => "duplicate",
+            SubmitOutcome::Rejected(_) => "rejected",
+            SubmitOutcome::Retriable(_) => "retriable",
+        });
         match outcome {
             SubmitOutcome::Accepted | SubmitOutcome::Duplicate => {
                 self.circuits.started(
@@ -530,7 +574,7 @@ impl StrategyService {
             .monitor
             .executions(&self.config.link.strategy_id, 1_000)
             .await?;
-        let mut unresolved_orphan = false;
+        let mut blocked_markets = BTreeSet::new();
         let now_ms = now_millis();
         let day_start_ms = now_ms.saturating_sub(86_400_000);
         let mut daily_profit = Decimal::ZERO;
@@ -542,8 +586,12 @@ impl StrategyService {
             }
             if matches!(execution.state.as_str(), "recovering" | "unknown")
                 || execution.recovery_action == "halted"
+                || matches!(
+                    execution.close_recovery_state.as_str(),
+                    "running" | "unknown" | "held_to_resolution"
+                )
             {
-                unresolved_orphan = true;
+                blocked_markets.insert(execution.market_id.clone());
             }
             if matches!(
                 execution.state.as_str(),
@@ -554,11 +602,10 @@ impl StrategyService {
                 self.circuits.terminal(&market_id, direction);
             }
         }
-        self.circuits.set_unresolved_orphan(unresolved_orphan);
+        self.blocked_markets = blocked_markets;
+        self.circuits.set_unresolved_orphan(false);
         self.daily_loss_halted = daily_profit <= -self.config.risk.daily_loss_limit;
-        if unresolved_orphan {
-            self.gates.relock_all("unresolved_orphan");
-        } else if self.daily_loss_halted {
+        if self.daily_loss_halted {
             self.gates.relock_all("daily_loss_limit");
         }
         Ok(())
@@ -622,6 +669,7 @@ impl StrategyService {
             store_coverage_a: coverage_a,
             store_coverage_b: coverage_b,
         })?;
+        crate::metrics::record_decision(reason);
         self.cycle_decisions_written = self.cycle_decisions_written.saturating_add(1);
         Ok(())
     }

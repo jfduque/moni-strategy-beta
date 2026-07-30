@@ -29,6 +29,12 @@ Decisions are stored in the SQLite database configured by
 JSONL file with the same path stem is imported transactionally and retained
 unchanged as a backup.
 
+`serve` exposes Prometheus metrics on the private socket configured by
+`metrics.bind` (default `127.0.0.1:9465`). Metrics cover cycle health, market
+counts, bounded decision-reason categories, independent opportunity episodes,
+submission outcomes, cache size, and calibration-gate readiness. They never
+label metrics with market, token, condition, tenant, or signal identifiers.
+
 From version 0.1.11, unchanged non-opportunity decisions are recorded on
 transition and every 15 minutes rather than on every evaluation cycle.
 Opportunity, submission, and error decisions are always recorded.

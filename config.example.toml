@@ -13,6 +13,9 @@ poll_interval_ms = 1000
 endpoint = "http://10.0.3.13:50054"
 snapshot_max_age_ms = 60000
 
+[metrics]
+bind = "127.0.0.1:9465"
+
 [discovery]
 gamma_endpoint = "https://gamma-api.polymarket.com/events"
 page_limit = 100
@@ -61,6 +64,10 @@ max_orphan_loss = "0.50"
 max_unmatched_inventory = "5"
 daily_loss_limit = "10"
 signals_per_minute = 10
+
+[recovery]
+enabled = true
+close_lead_ms = 30000
 
 [calibration]
 minimum_age_hours = 24
