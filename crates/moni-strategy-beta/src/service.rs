@@ -1,5 +1,5 @@
 use crate::clients::Monitor;
-use crate::clob::{RestClient, spawn_sharded_market_feed};
+use crate::clob::{MarketInfo, RestClient, spawn_sharded_market_feed};
 use crate::config::RuntimeConfig;
 use crate::decision_store::DecisionStore;
 use crate::gamma::{BinaryCryptoMarket, GammaClient};
@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, watch};
+
+const REJECTION_HEARTBEAT_MS: i64 = 15 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Decision {
@@ -90,6 +93,9 @@ pub struct StrategyService {
     episodes: EpisodeTracker,
     submitted: BTreeMap<String, (String, Direction, Decimal, String)>,
     daily_loss_halted: bool,
+    market_info: HashMap<String, MarketInfo>,
+    rejection_heartbeats: HashMap<String, (String, i64)>,
+    cycle_decisions_written: u64,
 }
 
 impl StrategyService {
@@ -137,6 +143,9 @@ impl StrategyService {
             episodes: EpisodeTracker::default(),
             submitted: BTreeMap::new(),
             daily_loss_halted: false,
+            market_info: HashMap::new(),
+            rejection_heartbeats: HashMap::new(),
+            cycle_decisions_written: 0,
         })
     }
 
@@ -164,12 +173,27 @@ impl StrategyService {
     }
 
     async fn iteration(&mut self, market_filter: Option<&str>) -> Result<()> {
+        let started = Instant::now();
         let now_ms = now_millis();
+        self.cycle_decisions_written = 0;
         self.reconcile_monitor().await?;
         let markets = self
             .gamma
             .discover(now_ms, self.config.discovery.max_horizon_ms)
             .await?;
+        let active_conditions = markets
+            .iter()
+            .map(|market| market.condition_id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.market_info
+            .retain(|condition_id, _| active_conditions.contains(condition_id.as_str()));
+        let active_markets = markets
+            .iter()
+            .map(|market| market.market_id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.rejection_heartbeats
+            .retain(|market_id, _| active_markets.contains(market_id.as_str()));
+        let cache_entries_before = self.market_info.len();
         let targets = markets
             .iter()
             .filter(|market| market.subscribable(now_ms, self.config.discovery.max_horizon_ms))
@@ -213,33 +237,28 @@ impl StrategyService {
             }
         }
         self.gates.save(&self.config.state.gate_state_path)?;
+        tracing::info!(
+            discovered_markets = markets.len(),
+            metadata_cache_entries = self.market_info.len(),
+            metadata_cache_new = self.market_info.len().saturating_sub(cache_entries_before),
+            decisions_written = self.cycle_decisions_written,
+            elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "strategy-beta evaluation cycle complete"
+        );
         Ok(())
     }
 
     async fn evaluate_market(&mut self, market: &BinaryCryptoMarket, now_ms: i64) -> Result<()> {
-        let info = self.rest.market_info(&market.condition_id).await?;
-        let expected_tokens = market
-            .outcomes
-            .iter()
-            .map(|outcome| outcome.token_id.clone())
-            .collect::<BTreeSet<_>>();
-        if info.token_ids.into_iter().collect::<BTreeSet<_>>() != expected_tokens {
-            bail!("Gamma/CLOB token mapping mismatch");
-        }
-        if info.tick_size != market.tick_size {
-            bail!("Gamma/CLOB tick size mismatch");
-        }
-        if !info.accepting_orders {
-            bail!("CLOB market is not accepting orders");
-        }
-        let fees = validate_fee_metadata(
-            market.gamma_fee_rate,
-            market.gamma_fee_exponent,
-            market.gamma_fee_taker_only,
-            info.fee_rate,
-            info.fee_exponent,
-            info.fee_taker_only,
-        )?;
+        let info = match self.market_info.get(&market.condition_id) {
+            Some(info) => info.clone(),
+            None => {
+                let info = self.rest.market_info(&market.condition_id).await?;
+                self.market_info
+                    .insert(market.condition_id.clone(), info.clone());
+                info
+            }
+        };
+        let fees = validate_market_info(market, &info)?;
         let (ws_a, ws_b) = {
             let books = self.books.read().await;
             (
@@ -295,6 +314,9 @@ impl StrategyService {
             return Ok(());
         };
 
+        let info = self.rest.market_info(&market.condition_id).await?;
+        let fees = validate_market_info(market, &info)?;
+        self.market_info.insert(market.condition_id.clone(), info);
         let token_ids = market
             .outcomes
             .iter()
@@ -340,6 +362,29 @@ impl StrategyService {
         .ok()
         .context("opportunity disappeared in final REST refresh")?;
 
+        self.finish_opportunity(
+            market,
+            now_ms,
+            bucket,
+            preliminary,
+            final_opportunity,
+            rest_a,
+            rest_b,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_opportunity(
+        &mut self,
+        market: &BinaryCryptoMarket,
+        now_ms: i64,
+        bucket: DurationBucket,
+        preliminary: Opportunity,
+        final_opportunity: Opportunity,
+        rest_a: &Book,
+        rest_b: &Book,
+    ) -> Result<()> {
         self.episodes
             .close_other_directions(&market.market_id, final_opportunity.direction);
         let episode = self
@@ -520,7 +565,7 @@ impl StrategyService {
     }
 
     fn log_decision(
-        &self,
+        &mut self,
         market: &BinaryCryptoMarket,
         opportunity: Option<&Opportunity>,
         submitted: bool,
@@ -528,8 +573,24 @@ impl StrategyService {
         coverage_a: Option<bool>,
         coverage_b: Option<bool>,
     ) -> Result<()> {
+        let observed_at_ms = now_millis();
+        if opportunity.is_none()
+            && !submitted
+            && matches!(
+                reason,
+                "no_profitable_depth" | "outside_price_band" | "market_not_subscribable"
+            )
+            && !should_log_rejection(
+                &mut self.rejection_heartbeats,
+                &market.market_id,
+                reason,
+                observed_at_ms,
+            )
+        {
+            return Ok(());
+        }
         self.decisions.append(&Decision {
-            observed_at_ms: now_millis(),
+            observed_at_ms,
             market_id: market.market_id.clone(),
             condition_id: Some(market.condition_id.clone()),
             token_id_a: market
@@ -546,7 +607,7 @@ impl StrategyService {
             gate_unlocked: opportunity
                 .and_then(|value| {
                     DurationBucket::from_remaining_ms(
-                        market.end_time_ms.saturating_sub(now_millis()),
+                        market.end_time_ms.saturating_sub(observed_at_ms),
                     )
                     .and_then(|bucket| {
                         self.gates.status(GateKey {
@@ -560,8 +621,57 @@ impl StrategyService {
             reason: reason.to_owned(),
             store_coverage_a: coverage_a,
             store_coverage_b: coverage_b,
-        })
+        })?;
+        self.cycle_decisions_written = self.cycle_decisions_written.saturating_add(1);
+        Ok(())
     }
+}
+
+fn validate_market_info(
+    market: &BinaryCryptoMarket,
+    info: &MarketInfo,
+) -> Result<crate::pricing::FeeSchedule> {
+    let expected_tokens = market
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.token_id.clone())
+        .collect::<BTreeSet<_>>();
+    if info.token_ids.iter().cloned().collect::<BTreeSet<_>>() != expected_tokens {
+        bail!("Gamma/CLOB token mapping mismatch");
+    }
+    if info.tick_size != market.tick_size {
+        bail!("Gamma/CLOB tick size mismatch");
+    }
+    if !info.accepting_orders {
+        bail!("CLOB market is not accepting orders");
+    }
+    validate_fee_metadata(
+        market.gamma_fee_rate,
+        market.gamma_fee_exponent,
+        market.gamma_fee_taker_only,
+        info.fee_rate,
+        info.fee_exponent,
+        info.fee_taker_only,
+    )
+}
+
+fn should_log_rejection(
+    heartbeats: &mut HashMap<String, (String, i64)>,
+    market_id: &str,
+    reason: &str,
+    observed_at_ms: i64,
+) -> bool {
+    if heartbeats
+        .get(market_id)
+        .is_some_and(|(previous, logged_at_ms)| {
+            previous == reason
+                && observed_at_ms.saturating_sub(*logged_at_ms) < REJECTION_HEARTBEAT_MS
+        })
+    {
+        return false;
+    }
+    heartbeats.insert(market_id.to_owned(), (reason.to_owned(), observed_at_ms));
+    true
 }
 
 fn stable_signal_id(
@@ -609,4 +719,86 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gamma::OutcomeToken;
+
+    #[test]
+    fn repeated_rejections_log_on_change_or_heartbeat() {
+        let mut heartbeats = HashMap::new();
+        assert!(should_log_rejection(
+            &mut heartbeats,
+            "market",
+            "no_profitable_depth",
+            1_000
+        ));
+        assert!(!should_log_rejection(
+            &mut heartbeats,
+            "market",
+            "no_profitable_depth",
+            2_000
+        ));
+        assert!(should_log_rejection(
+            &mut heartbeats,
+            "market",
+            "outside_price_band",
+            3_000
+        ));
+        assert!(should_log_rejection(
+            &mut heartbeats,
+            "market",
+            "outside_price_band",
+            3_000 + REJECTION_HEARTBEAT_MS
+        ));
+    }
+
+    #[test]
+    fn market_info_validation_rejects_changed_token_mapping() {
+        let market = BinaryCryptoMarket {
+            market_id: "market".to_owned(),
+            condition_id: "condition".to_owned(),
+            question: "question".to_owned(),
+            rules: "rules".to_owned(),
+            underlying: "BTC".to_owned(),
+            outcomes: [
+                OutcomeToken {
+                    label: "Yes".to_owned(),
+                    token_id: "a".to_owned(),
+                },
+                OutcomeToken {
+                    label: "No".to_owned(),
+                    token_id: "b".to_owned(),
+                },
+            ],
+            start_time_ms: None,
+            end_time_ms: 10_000,
+            tick_size: Decimal::new(1, 2),
+            min_order_size: Decimal::ONE,
+            neg_risk: false,
+            gamma_fee_rate: Some(Decimal::new(7, 2)),
+            gamma_fee_exponent: Some(1),
+            gamma_fee_taker_only: Some(true),
+            active: true,
+            accepting_orders: true,
+        };
+        let info = MarketInfo {
+            condition_id: "condition".to_owned(),
+            token_ids: vec!["a".to_owned(), "different".to_owned()],
+            fee_rate: Some(Decimal::new(7, 2)),
+            fee_exponent: Some(1),
+            fee_taker_only: Some(true),
+            tick_size: Decimal::new(1, 2),
+            accepting_orders: true,
+        };
+
+        assert!(
+            validate_market_info(&market, &info)
+                .unwrap_err()
+                .to_string()
+                .contains("token mapping mismatch")
+        );
+    }
 }

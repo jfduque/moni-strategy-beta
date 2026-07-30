@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use moni_proto::store::v1::BookSnapshot;
 use std::collections::{BTreeSet, HashMap};
 
+const DECISION_BATCH_SIZE: usize = 2_048;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Summary {
     pub decisions: u64,
@@ -21,37 +23,55 @@ pub async fn summarize_config(config: &RuntimeConfig) -> Result<Summary> {
     let store_path = &config.state.decision_db_path;
     let decisions =
         DecisionStore::open(store_path).with_context(|| format!("opening {store_path}"))?;
-    let scope = decisions
-        .calibration_scope()
+    let through_id = decisions
+        .latest_calibration_id()
         .with_context(|| format!("reading {store_path}"))?;
-
-    let snapshots = match scope {
-        None => HashMap::new(),
-        Some(scope) => {
-            let from_ms = scope
-                .earliest_ms
-                .saturating_sub(config.store.snapshot_max_age_ms as i64);
-            let token_ids = scope.token_ids.into_iter().collect::<BTreeSet<_>>();
-            let mut store = Store::connect(config.store.endpoint.clone()).await?;
-            let rows = store
-                .snapshots(token_ids.into_iter().collect(), from_ms, scope.latest_ms)
-                .await?;
-            let mut snapshots = HashMap::<String, Vec<BookSnapshot>>::new();
-            for row in rows {
-                snapshots.entry(row.token_id.clone()).or_default().push(row);
-            }
-            snapshots
-        }
-    };
-
-    // Streamed rather than collected: the live table outgrows the container's
-    // memory long before this command is worth running.
+    let mut store = Store::connect(config.store.endpoint.clone()).await?;
     let mut accumulator = Accumulator::default();
-    decisions
-        .for_each_calibration_row(|row| {
-            accumulator.observe(&row, &snapshots, config.store.snapshot_max_age_ms)
-        })
-        .with_context(|| format!("reading {store_path}"))?;
+    let mut after_id = 0;
+    while after_id < through_id {
+        let batch = decisions
+            .calibration_batch(after_id, through_id, DECISION_BATCH_SIZE)
+            .with_context(|| format!("reading {store_path}"))?;
+        let Some((last_id, _)) = batch.last() else {
+            break;
+        };
+        after_id = *last_id;
+        let rows = batch.iter().map(|(_, row)| row).collect::<Vec<_>>();
+        let token_ids = rows
+            .iter()
+            .flat_map(|row| [&row.token_id_a, &row.token_id_b])
+            .filter_map(|token| token.as_ref().cloned())
+            .collect::<BTreeSet<_>>();
+        let from_ms = rows
+            .iter()
+            .map(|row| {
+                row.observed_at_ms
+                    .saturating_sub(config.store.snapshot_max_age_ms as i64)
+            })
+            .min()
+            .unwrap_or_default();
+        let to_ms = rows
+            .iter()
+            .map(|row| row.observed_at_ms)
+            .max()
+            .unwrap_or(from_ms);
+        let mut snapshots = HashMap::<String, Vec<BookSnapshot>>::new();
+        if !token_ids.is_empty() {
+            for snapshot in store
+                .snapshots(token_ids.into_iter().collect(), from_ms, to_ms)
+                .await?
+            {
+                snapshots
+                    .entry(snapshot.token_id.clone())
+                    .or_default()
+                    .push(snapshot);
+            }
+        }
+        for row in rows {
+            accumulator.observe(row, &snapshots, config.store.snapshot_max_age_ms);
+        }
+    }
     Ok(accumulator.finish())
 }
 
@@ -117,11 +137,11 @@ pub(crate) fn summarize(
     accumulator.finish()
 }
 
-fn preceding_snapshot<'a>(
-    snapshots: Option<&'a Vec<BookSnapshot>>,
+fn preceding_snapshot(
+    snapshots: Option<&Vec<BookSnapshot>>,
     observed_at_ms: i64,
     max_age_ms: u64,
-) -> Option<&'a BookSnapshot> {
+) -> Option<&BookSnapshot> {
     snapshots?
         .iter()
         .filter(|snapshot| {

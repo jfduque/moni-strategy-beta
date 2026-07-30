@@ -68,13 +68,6 @@ pub(crate) struct CalibrationRow {
     pub(crate) token_id_b: Option<String>,
 }
 
-/// Time span and token set covered by decisions naming both legs.
-pub(crate) struct CalibrationScope {
-    pub(crate) earliest_ms: i64,
-    pub(crate) latest_ms: i64,
-    pub(crate) token_ids: Vec<String>,
-}
-
 /// Append-only SQLite store for per-market decisions.
 pub(crate) struct DecisionStore {
     connection: Mutex<Connection>,
@@ -136,66 +129,53 @@ impl DecisionStore {
         Ok(())
     }
 
-    /// Time span and distinct tokens across decisions that name both legs.
-    ///
-    /// Aggregated inside SQLite so the row set never reaches memory; returns
-    /// `None` when no decision names both legs.
-    pub(crate) fn calibration_scope(&self) -> Result<Option<CalibrationScope>> {
+    pub(crate) fn latest_calibration_id(&self) -> Result<i64> {
         let connection = self
             .connection
             .lock()
             .expect("decision store mutex poisoned");
-        let span = connection
-            .query_row(
-                "SELECT min(observed_at_ms), max(observed_at_ms) FROM decisions
-                 WHERE token_id_a IS NOT NULL AND token_id_b IS NOT NULL",
-                [],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-            )
-            .context("querying the decision time span")?;
-        let (Some(earliest_ms), Some(latest_ms)) = span else {
-            return Ok(None);
-        };
-        let mut statement = connection
-            .prepare(
-                "SELECT token_id_a FROM decisions WHERE token_id_a IS NOT NULL
-                 UNION
-                 SELECT token_id_b FROM decisions WHERE token_id_b IS NOT NULL",
-            )
-            .context("preparing the decision token query")?;
-        let token_ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("querying decision tokens")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("reading decision tokens")?;
-        Ok(Some(CalibrationScope {
-            earliest_ms,
-            latest_ms,
-            token_ids,
-        }))
+        connection
+            .query_row("SELECT coalesce(max(id), 0) FROM decisions", [], |row| {
+                row.get(0)
+            })
+            .context("querying latest decision id")
     }
 
-    /// Streams each decision's calibration fields in insertion order.
-    pub(crate) fn for_each_calibration_row(
+    /// Reads a bounded, stable slice of calibration fields in insertion order.
+    pub(crate) fn calibration_batch(
         &self,
-        mut visit: impl FnMut(CalibrationRow),
-    ) -> Result<()> {
+        after_id: i64,
+        through_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, CalibrationRow)>> {
         let connection = self
             .connection
             .lock()
             .expect("decision store mutex poisoned");
         let mut statement = connection
-            .prepare("SELECT observed_at_ms, token_id_a, token_id_b FROM decisions ORDER BY id")
+            .prepare(
+                "SELECT id, observed_at_ms, token_id_a, token_id_b
+                 FROM decisions
+                 WHERE id > ?1 AND id <= ?2
+                 ORDER BY id
+                 LIMIT ?3",
+            )
             .context("preparing the calibration row query")?;
-        let mut rows = statement.query([]).context("querying calibration rows")?;
+        let mut rows = statement
+            .query(params![after_id, through_id, limit as i64])
+            .context("querying calibration rows")?;
+        let mut batch = Vec::with_capacity(limit);
         while let Some(row) = rows.next().context("reading a calibration row")? {
-            visit(CalibrationRow {
-                observed_at_ms: row.get(0).context("reading observed_at_ms")?,
-                token_id_a: row.get(1).context("reading token_id_a")?,
-                token_id_b: row.get(2).context("reading token_id_b")?,
-            });
+            batch.push((
+                row.get(0).context("reading decision id")?,
+                CalibrationRow {
+                    observed_at_ms: row.get(1).context("reading observed_at_ms")?,
+                    token_id_a: row.get(2).context("reading token_id_a")?,
+                    token_id_b: row.get(3).context("reading token_id_b")?,
+                },
+            ));
         }
-        Ok(())
+        Ok(batch)
     }
 
     /// Loads every decision in full. Test-only: it materializes the whole
@@ -306,10 +286,8 @@ mod tests {
         path
     }
 
-    /// The summary's read path. Streaming matters here: the live table is
-    /// large enough that collecting it exhausts the container's memory.
     #[test]
-    fn streams_calibration_rows_in_insertion_order() {
+    fn reads_calibration_rows_in_bounded_insertion_order_batches() {
         let path = temp_path("stream");
         let store = DecisionStore::open(&path).unwrap();
         for index in 0..3 {
@@ -319,12 +297,16 @@ mod tests {
             store.append(&row).unwrap();
         }
 
-        let mut seen = Vec::new();
-        store
-            .for_each_calibration_row(|row| {
-                seen.push((row.observed_at_ms, row.token_id_a, row.token_id_b))
-            })
+        let through_id = store.latest_calibration_id().unwrap();
+        let first = store.calibration_batch(0, through_id, 2).unwrap();
+        let second = store
+            .calibration_batch(first.last().unwrap().0, through_id, 2)
             .unwrap();
+        let seen = first
+            .into_iter()
+            .chain(second)
+            .map(|(_, row)| (row.observed_at_ms, row.token_id_a, row.token_id_b))
+            .collect::<Vec<_>>();
         assert_eq!(
             seen,
             vec![
@@ -337,33 +319,15 @@ mod tests {
     }
 
     #[test]
-    fn calibration_scope_reports_span_and_distinct_tokens() {
-        let path = temp_path("scope");
+    fn calibration_upper_bound_excludes_rows_appended_after_summary_start() {
+        let path = temp_path("upper-bound");
         let store = DecisionStore::open(&path).unwrap();
-        for observed_at_ms in [3_000, 1_000, 2_000] {
-            let mut row = decision("no_profitable_depth");
-            row.observed_at_ms = observed_at_ms;
-            store.append(&row).unwrap();
-        }
+        store.append(&decision("no_profitable_depth")).unwrap();
+        let through_id = store.latest_calibration_id().unwrap();
+        store.append(&decision("outside_price_band")).unwrap();
 
-        let scope = store.calibration_scope().unwrap().unwrap();
-        assert_eq!(scope.earliest_ms, 1_000);
-        assert_eq!(scope.latest_ms, 3_000);
-        // UNION de-duplicates across both leg columns.
-        assert_eq!(scope.token_ids, vec!["token-a", "token-b"]);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn calibration_scope_is_none_when_no_decision_names_both_legs() {
-        let path = temp_path("scope-empty");
-        let store = DecisionStore::open(&path).unwrap();
-        let mut row = decision("market_not_subscribable");
-        row.token_id_a = None;
-        row.token_id_b = None;
-        store.append(&row).unwrap();
-
-        assert!(store.calibration_scope().unwrap().is_none());
+        let batch = store.calibration_batch(0, through_id, 10).unwrap();
+        assert_eq!(batch.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 

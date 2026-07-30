@@ -28,3 +28,7 @@ Decisions are stored in the SQLite database configured by
 `state.decision_db_path`. When that database is first created, an existing
 JSONL file with the same path stem is imported transactionally and retained
 unchanged as a backup.
+
+From version 0.1.11, unchanged non-opportunity decisions are recorded on
+transition and every 15 minutes rather than on every evaluation cycle.
+Opportunity, submission, and error decisions are always recorded.
