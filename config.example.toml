@@ -41,13 +41,13 @@ max_rest_round_trip_ms = 500
 minimum_profit = "0.10"
 # Polymarket's taker fee (rate * price * (1-price)) peaks near the 50c coinflip
 # point; a 7% crypto-category rate alone costs ~350bps round-trip there, well
-# above any realistic complete-set mispricing. price_band_low_max/high_min
-# restrict evaluation to markets trading away from that dead zone, where the
-# fee floor drops enough (~65-130bps near 0.05/0.95) for a real edge to clear.
+# above most complete-set mispricings. price_band_low_max/high_min keep the
+# coinflip dead zone out while allowing the exact fee-aware profitability
+# calculation to evaluate a wider range of prices.
 minimum_return_bps = "60"
 depth_fraction = "0.25"
-price_band_low_max = "0.15"
-price_band_high_min = "0.85"
+price_band_low_max = "0.25"
+price_band_high_min = "0.75"
 
 [reserves]
 slippage_bps = "10"

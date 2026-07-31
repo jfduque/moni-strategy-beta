@@ -235,11 +235,11 @@ pub struct ProfitabilityConfig {
 }
 
 fn default_price_band_low_max() -> Decimal {
-    Decimal::new(15, 2)
+    Decimal::new(25, 2)
 }
 
 fn default_price_band_high_min() -> Decimal {
-    Decimal::new(85, 2)
+    Decimal::new(75, 2)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -335,8 +335,8 @@ max_rest_round_trip_ms = 500
 minimum_profit = "0.10"
 minimum_return_bps = "200"
 depth_fraction = "0.25"
-price_band_low_max = "0.15"
-price_band_high_min = "0.85"
+price_band_low_max = "0.25"
+price_band_high_min = "0.75"
 [reserves]
 slippage_bps = "10"
 latency = "0.01"
@@ -400,21 +400,21 @@ gate_state_path = "/var/lib/moni-strategy-beta/gates.json"
     #[test]
     fn price_band_defaults_for_existing_configs() {
         let raw = VALID
-            .replace("price_band_low_max = \"0.15\"\n", "")
-            .replace("price_band_high_min = \"0.85\"\n", "");
+            .replace("price_band_low_max = \"0.25\"\n", "")
+            .replace("price_band_high_min = \"0.75\"\n", "");
         let config = RuntimeConfig::from_toml_str(&raw).unwrap();
 
-        assert_eq!(config.profitability.price_band_low_max, Decimal::new(15, 2));
+        assert_eq!(config.profitability.price_band_low_max, Decimal::new(25, 2));
         assert_eq!(
             config.profitability.price_band_high_min,
-            Decimal::new(85, 2)
+            Decimal::new(75, 2)
         );
     }
 
     #[test]
     fn rejects_inverted_price_band() {
         let raw = VALID.replace(
-            "price_band_low_max = \"0.15\"",
+            "price_band_low_max = \"0.25\"",
             "price_band_low_max = \"0.90\"",
         );
         assert!(RuntimeConfig::from_toml_str(&raw).is_err());

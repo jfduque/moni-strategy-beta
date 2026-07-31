@@ -391,8 +391,8 @@ mod tests {
             minimum_profit: Decimal::ZERO,
             minimum_return_bps: Decimal::ZERO,
             depth_fraction: Decimal::ONE,
-            price_band_low_max: d("0.15"),
-            price_band_high_min: d("0.85"),
+            price_band_low_max: d("0.25"),
+            price_band_high_min: d("0.75"),
         }
     }
 
@@ -429,8 +429,8 @@ mod tests {
             Err(Rejection::OutsidePriceBand)
         );
 
-        let extreme_a = book("a", &[], &[("0.05", "10")], 100);
-        let extreme_b = book("b", &[], &[("0.05", "10")], 100);
+        let extreme_a = book("a", &[], &[("0.20", "10")], 100);
+        let extreme_b = book("b", &[], &[("0.20", "10")], 100);
         assert!(
             best_for_direction(
                 &extreme_a,
