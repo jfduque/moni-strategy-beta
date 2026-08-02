@@ -64,6 +64,7 @@ fn direction_from_str(raw: &str) -> Result<Direction> {
 /// a row at a time instead.
 pub(crate) struct CalibrationRow {
     pub(crate) observed_at_ms: i64,
+    pub(crate) condition_id: Option<String>,
     pub(crate) token_id_a: Option<String>,
     pub(crate) token_id_b: Option<String>,
 }
@@ -154,7 +155,7 @@ impl DecisionStore {
             .expect("decision store mutex poisoned");
         let mut statement = connection
             .prepare(
-                "SELECT id, observed_at_ms, token_id_a, token_id_b
+                "SELECT id, observed_at_ms, condition_id, token_id_a, token_id_b
                  FROM decisions
                  WHERE id > ?1 AND id <= ?2
                  ORDER BY id
@@ -170,8 +171,9 @@ impl DecisionStore {
                 row.get(0).context("reading decision id")?,
                 CalibrationRow {
                     observed_at_ms: row.get(1).context("reading observed_at_ms")?,
-                    token_id_a: row.get(2).context("reading token_id_a")?,
-                    token_id_b: row.get(3).context("reading token_id_b")?,
+                    condition_id: row.get(2).context("reading condition_id")?,
+                    token_id_a: row.get(3).context("reading token_id_a")?,
+                    token_id_b: row.get(4).context("reading token_id_b")?,
                 },
             ));
         }

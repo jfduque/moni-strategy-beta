@@ -59,6 +59,11 @@ impl RuntimeConfig {
         if self.metrics.bind.parse::<std::net::SocketAddr>().is_err() {
             bail!("metrics.bind must be a socket address");
         }
+        if self.store.assumed_taker_fee_rate <= Decimal::ZERO
+            || self.store.assumed_taker_fee_rate > Decimal::ONE
+        {
+            bail!("store.assumed_taker_fee_rate must be in (0, 1]");
+        }
         if self.discovery.gamma_endpoint.trim().is_empty()
             || self.discovery.page_limit == 0
             || self.discovery.max_pages == 0
@@ -166,6 +171,12 @@ pub struct MonitorConfig {
 pub struct StoreConfig {
     pub endpoint: String,
     pub snapshot_max_age_ms: u64,
+    #[serde(default = "default_replay_fee_rate")]
+    pub assumed_taker_fee_rate: Decimal,
+}
+
+fn default_replay_fee_rate() -> Decimal {
+    Decimal::new(7, 2)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -225,6 +236,8 @@ pub struct QualityConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfitabilityConfig {
+    #[serde(default = "default_true")]
+    pub price_band_enabled: bool,
     pub minimum_profit: Decimal,
     pub minimum_return_bps: Decimal,
     pub depth_fraction: Decimal,
@@ -232,6 +245,10 @@ pub struct ProfitabilityConfig {
     pub price_band_low_max: Decimal,
     #[serde(default = "default_price_band_high_min")]
     pub price_band_high_min: Decimal,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 fn default_price_band_low_max() -> Decimal {

@@ -12,6 +12,7 @@ poll_interval_ms = 1000
 [store]
 endpoint = "http://10.0.3.13:50054"
 snapshot_max_age_ms = 60000
+assumed_taker_fee_rate = "0.07"          # historical replay only; printed in reports
 
 [metrics]
 bind = "127.0.0.1:9465"
@@ -38,6 +39,7 @@ rest_timeout_ms = 500
 max_rest_round_trip_ms = 500
 
 [profitability]
+price_band_enabled = true
 minimum_profit = "0.10"
 # Polymarket's taker fee (rate * price * (1-price)) peaks near the 50c coinflip
 # point; a 7% crypto-category rate alone costs ~350bps round-trip there, well

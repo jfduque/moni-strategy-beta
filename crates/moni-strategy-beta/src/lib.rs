@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod pricing;
 pub mod service;
 pub mod store_calibration;
+pub mod store_replay;
 
 use anyhow::{Context, Result, bail};
 use config::{DEFAULT_CONFIG_PATH, RuntimeConfig};
@@ -152,6 +153,48 @@ where
             );
             Ok(())
         }
+        "store-replay-summary" => {
+            let config = RuntimeConfig::load(&config_path)?;
+            let report = store_replay::summarize_config(&config).await?;
+            println!(
+                "eligible={} both_legs={} coverage_bps={} assumed_taker_fee_rate={}",
+                report.eligible_decisions,
+                report.both_legs_covered,
+                report.coverage_bps,
+                report.assumed_taker_fee_rate,
+            );
+            println!(
+                "funnel paired={} frictionless={} fee_positive={} reserve_positive={} configured={}",
+                report.funnel.paired_observations,
+                report.funnel.frictionless,
+                report.funnel.fee_positive,
+                report.funnel.reserve_positive,
+                report.funnel.configured,
+            );
+            let Some(candidate) = report.selected else {
+                println!("selected_candidate=none holdout_pass=false");
+                return Ok(());
+            };
+            println!(
+                "selected_candidate band={} minimum_profit={} minimum_return_bps={} depth_fraction={}",
+                candidate.price_band,
+                candidate.minimum_profit,
+                candidate.minimum_return_bps,
+                candidate.depth_fraction,
+            );
+            for (name, slice) in [
+                ("train", &candidate.train),
+                ("validation", &candidate.validation),
+                ("holdout", &candidate.holdout),
+            ] {
+                println!(
+                    "{name} stable_episodes={} distinct_markets={} total_profit={}",
+                    slice.stable_episodes, slice.distinct_markets, slice.total_profit,
+                );
+            }
+            println!("holdout_pass={}", candidate.holdout_pass);
+            Ok(())
+        }
         "manual-signal" => {
             let config = RuntimeConfig::load(&config_path)?;
             let market = args.get(2).context("manual-signal requires MARKET_ID")?;
@@ -167,7 +210,7 @@ where
         }
         _ => {
             println!(
-                "usage: moni-strategy-beta <serve|--discover-only|calibration-summary|store-calibration-summary|execution-summary|manual-signal MARKET_ID> [--config PATH] [--dry-run] [--confirm MANUAL_DIAGNOSTIC_ONLY]"
+                "usage: moni-strategy-beta <serve|--discover-only|calibration-summary|store-calibration-summary|store-replay-summary|execution-summary|manual-signal MARKET_ID> [--config PATH] [--dry-run] [--confirm MANUAL_DIAGNOSTIC_ONLY]"
             );
             Ok(())
         }

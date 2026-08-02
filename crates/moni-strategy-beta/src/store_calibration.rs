@@ -181,6 +181,7 @@ mod tests {
     fn decision(observed_at_ms: i64) -> CalibrationRow {
         CalibrationRow {
             observed_at_ms,
+            condition_id: Some("condition".to_owned()),
             token_id_a: Some("a".to_owned()),
             token_id_b: Some("b".to_owned()),
         }

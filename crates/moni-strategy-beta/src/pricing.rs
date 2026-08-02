@@ -178,7 +178,9 @@ pub fn best_for_direction(
     let levels_a = levels(book_a, side);
     let levels_b = levels(book_b, side);
     let top_price = levels_a.first().ok_or(Rejection::NoProfitableDepth)?.price;
-    if top_price > profitability.price_band_low_max && top_price < profitability.price_band_high_min
+    if profitability.price_band_enabled
+        && top_price > profitability.price_band_low_max
+        && top_price < profitability.price_band_high_min
     {
         // Polymarket's taker fee is rate * price * (1 - price), which peaks at the
         // 50c coinflip point. Inside the band, round-trip fees alone (~350bps at
@@ -388,6 +390,7 @@ mod tests {
 
     fn profitability() -> ProfitabilityConfig {
         ProfitabilityConfig {
+            price_band_enabled: true,
             minimum_profit: Decimal::ZERO,
             minimum_return_bps: Decimal::ZERO,
             depth_fraction: Decimal::ONE,

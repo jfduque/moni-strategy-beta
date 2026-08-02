@@ -17,6 +17,7 @@ moni-strategy-beta serve --dry-run
 moni-strategy-beta --discover-only --config ./config.example.toml
 moni-strategy-beta calibration-summary
 moni-strategy-beta store-calibration-summary
+moni-strategy-beta store-replay-summary
 moni-strategy-beta execution-summary
 ```
 

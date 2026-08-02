@@ -339,6 +339,7 @@ impl StrategyService {
 
         let info = self.rest.market_info(&market.condition_id).await?;
         let fees = validate_market_info(market, &info)?;
+        let tick_size = info.tick_size;
         self.market_info.insert(market.condition_id.clone(), info);
         let token_ids = market
             .outcomes
@@ -361,7 +362,7 @@ impl StrategyService {
             rest_b,
             preliminary.quantity,
             preliminary.direction,
-            market.tick_size,
+            tick_size,
             now_ms,
             round_trip_ms,
             &self.config.quality,
@@ -688,7 +689,12 @@ fn validate_market_info(
         bail!("Gamma/CLOB token mapping mismatch");
     }
     if info.tick_size != market.tick_size {
-        bail!("Gamma/CLOB tick size mismatch");
+        tracing::warn!(
+            market_id = %market.market_id,
+            gamma_tick_size = %market.tick_size,
+            clob_tick_size = %info.tick_size,
+            "Gamma tick size differs from the current CLOB value; using CLOB"
+        );
     }
     if !info.accepting_orders {
         bail!("CLOB market is not accepting orders");
@@ -774,6 +780,48 @@ mod tests {
     use super::*;
     use crate::gamma::OutcomeToken;
 
+    fn test_market() -> BinaryCryptoMarket {
+        BinaryCryptoMarket {
+            market_id: "market".to_owned(),
+            condition_id: "condition".to_owned(),
+            question: "question".to_owned(),
+            rules: "rules".to_owned(),
+            underlying: "BTC".to_owned(),
+            outcomes: [
+                OutcomeToken {
+                    label: "Yes".to_owned(),
+                    token_id: "a".to_owned(),
+                },
+                OutcomeToken {
+                    label: "No".to_owned(),
+                    token_id: "b".to_owned(),
+                },
+            ],
+            start_time_ms: None,
+            end_time_ms: 10_000,
+            tick_size: Decimal::new(1, 2),
+            min_order_size: Decimal::ONE,
+            neg_risk: false,
+            gamma_fee_rate: Some(Decimal::new(7, 2)),
+            gamma_fee_exponent: Some(1),
+            gamma_fee_taker_only: Some(true),
+            active: true,
+            accepting_orders: true,
+        }
+    }
+
+    fn test_market_info() -> MarketInfo {
+        MarketInfo {
+            condition_id: "condition".to_owned(),
+            token_ids: vec!["a".to_owned(), "b".to_owned()],
+            fee_rate: Some(Decimal::new(7, 2)),
+            fee_exponent: Some(1),
+            fee_taker_only: Some(true),
+            tick_size: Decimal::new(1, 2),
+            accepting_orders: true,
+        }
+    }
+
     #[test]
     fn repeated_rejections_log_on_change_or_heartbeat() {
         let mut heartbeats = HashMap::new();
@@ -848,5 +896,14 @@ mod tests {
                 .to_string()
                 .contains("token mapping mismatch")
         );
+    }
+
+    #[test]
+    fn market_info_validation_accepts_a_dynamic_clob_tick() {
+        let mut market = test_market();
+        market.tick_size = Decimal::new(1, 2);
+        let mut info = test_market_info();
+        info.tick_size = Decimal::new(1, 3);
+        assert!(validate_market_info(&market, &info).is_ok());
     }
 }
